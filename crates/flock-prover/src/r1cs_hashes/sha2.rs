@@ -46,7 +46,7 @@
 //! - `H_out[w]` — the public output of the compression.
 
 use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit};
-use flock_core::field::F128;
+use flock_core::field::F256;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -646,9 +646,9 @@ fn scatter_add32_inline<F: Fn(usize) -> usize>(
     x: &Word,
     y: &Word,
     carry_slot: F,
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
+    comb: &mut [F256],
+    alpha: F256,
+    eq_inner: &[F256],
 ) -> Word {
     let mut sum = zero_word();
     let mut cin: Sup = Sup::new();
@@ -674,9 +674,9 @@ fn scatter_add32_inline<F: Fn(usize) -> usize>(
 fn scatter_materialize<F: Fn(usize) -> usize>(
     raw: &Word,
     slot_fn: F,
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
+    comb: &mut [F256],
+    alpha: F256,
+    eq_inner: &[F256],
 ) -> Word {
     let mut out = zero_word();
     for b in 0..WORD_BITS {
@@ -697,9 +697,9 @@ fn scatter_add32_alloc<F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
     y: &Word,
     carry_slot: F1,
     sum_slot: F2,
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
+    comb: &mut [F256],
+    alpha: F256,
+    eq_inner: &[F256],
 ) -> Word {
     let raw = scatter_add32_inline(x, y, carry_slot, comb, alpha, eq_inner);
     scatter_materialize(&raw, sum_slot, comb, alpha, eq_inner)
@@ -712,9 +712,9 @@ impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
         K
     }
 
-    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+    fn fold_alpha_batched(&self, alpha: F256, eq_inner: &[F256]) -> Vec<F256> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut comb = vec![F128::ZERO; K];
+        let mut comb = vec![F256::ZERO; K];
 
         let e0 = eq_inner[Z_CONST_POS];
         comb[Z_CONST_POS] += alpha * e0;
@@ -1177,7 +1177,7 @@ fn build_block_ab_packed_into(
     }
 }
 
-/// Like [`generate_witness`] but produces F128-packed `(z, a, b, c)` AND the
+/// Like [`generate_witness`] but produces F256-packed `(z, a, b, c)` AND the
 /// lincheck byte-stripe in one fused parallel pass. Replaces
 /// `pack_witness` + `apply_{a,b,c}_packed` + `pack_z_lincheck_from_packed`.
 ///
@@ -1186,9 +1186,9 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
 ) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F256>,
+    Vec<flock_core::field::F256>,
+    Vec<flock_core::field::F256>,
     Vec<u8>,
 ) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
@@ -1339,7 +1339,7 @@ impl Sha256HybridSetup {
     pub fn generate_witness_packed(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
-    ) -> Vec<flock_core::field::F128> {
+    ) -> Vec<flock_core::field::F256> {
         let (z_packed, _a, _b, _stripe) =
             generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
         z_packed
@@ -1935,6 +1935,7 @@ impl Sha256HybridSetup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flock_core::field::F128;
 
     /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);
@@ -2053,16 +2054,20 @@ mod tests {
         assert_eq!(sparse.n_cols(), walker.n_cols());
 
         let n_cols = walker.n_cols();
-        let alpha = F128 {
-            lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-            hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+        let mut rand_f256 = || {
+            F256::new(
+                F128 {
+                    lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                    hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                },
+                F128 {
+                    lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                    hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                },
+            )
         };
-        let eq_inner: Vec<F128> = (0..n_cols)
-            .map(|_| F128 {
-                lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-                hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-            })
-            .collect();
+        let alpha = rand_f256();
+        let eq_inner: Vec<F256> = (0..n_cols).map(|_| rand_f256()).collect();
 
         let expected = sparse.fold_alpha_batched(alpha, &eq_inner);
         let got = walker.fold_alpha_batched(alpha, &eq_inner);
@@ -2207,9 +2212,12 @@ mod tests {
         let zeros: Vec<([u32; 8], [u32; 16])> = vec![([0u32; 8], [0u32; 16]); n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_blocks_log());
-        z.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
-        a.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
-        b.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
+        z.iter_mut()
+            .for_each(|v| *v = flock_core::field::F256::ZERO);
+        a.iter_mut()
+            .for_each(|v| *v = flock_core::field::F256::ZERO);
+        b.iter_mut()
+            .for_each(|v| *v = flock_core::field::F256::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let mut ch_p = FsChallenger::new(b"poc");

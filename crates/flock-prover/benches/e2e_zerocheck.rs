@@ -98,8 +98,10 @@ fn main() {
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
             println!("  {:<40} {:>10.2} ms", label, elapsed);
             best_ms = best_ms.min(elapsed);
-            cs ^=
-                proof.final_a_eval.lo ^ proof.final_b_eval.lo ^ proof.final_c_eval.lo ^ claim.z.lo;
+            cs ^= proof.final_a_eval.c0.lo
+                ^ proof.final_b_eval.c0.lo
+                ^ proof.final_c_eval.c0.lo
+                ^ claim.z.c0.lo;
         }
         if n_runs > 1 {
             println!("  {:<40} {:>10.2} ms", "  (best)", best_ms);

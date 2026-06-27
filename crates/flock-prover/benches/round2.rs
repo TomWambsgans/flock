@@ -9,7 +9,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::{F8, F128};
+use flock_prover::field::{F8, F128, F256};
 use flock_prover::zerocheck::multilinear::{
     UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed,
 };
@@ -41,13 +41,19 @@ impl Rng {
             buf[i..].copy_from_slice(&v[..len - i]);
         }
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
-    fn f128_vec(&mut self, n: usize) -> Vec<F128> {
+    fn f128_vec(&mut self, n: usize) -> Vec<F256> {
         (0..n).map(|_| self.f128()).collect()
     }
 }
@@ -127,15 +133,15 @@ fn main() {
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
             println!("  {:<40} {:>10.2} ms", label, elapsed);
             best_ms = best_ms.min(elapsed);
-            cs_a ^= a_mlv[0].lo;
-            cs_b ^= b_mlv[0].lo;
-            cs_msg ^= m1.lo ^ minf.lo;
+            cs_a ^= a_mlv[0].c0.lo;
+            cs_b ^= b_mlv[0].c0.lo;
+            cs_msg ^= m1.c0.lo ^ minf.c0.lo;
         }
         if n_runs > 1 {
             println!("  {:<40} {:>10.2} ms", "  (best)", best_ms);
         }
         println!(
-            "  checksums: a_mlv[0].lo={cs_a:016x}  b_mlv[0].lo={cs_b:016x}  msg={cs_msg:016x}"
+            "  checksums: a_mlv[0].c0.lo={cs_a:016x}  b_mlv[0].c0.lo={cs_b:016x}  msg={cs_msg:016x}"
         );
     }
 }

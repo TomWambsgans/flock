@@ -90,7 +90,7 @@
 
 use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
 use flock_core::challenger::Challenger;
-use flock_core::field::F128;
+use flock_core::field::F256;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProof};
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
@@ -639,9 +639,9 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 
 #[inline]
 fn scatter_add_carry_rows(
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
+    comb: &mut [F256],
+    alpha: F256,
+    eq_inner: &[F256],
     x: &Word,
     y: &Word,
     carry_base: usize,
@@ -668,9 +668,9 @@ fn scatter_add_carry_rows(
 
 #[inline]
 fn scatter_lin_id_row(
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
+    comb: &mut [F256],
+    alpha: F256,
+    eq_inner: &[F256],
     row: usize,
     word_bits_i: &[usize],
 ) {
@@ -689,9 +689,9 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
         K
     }
 
-    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+    fn fold_alpha_batched(&self, alpha: F256, eq_inner: &[F256]) -> Vec<F256> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut comb = vec![F128::ZERO; K];
+        let mut comb = vec![F256::ZERO; K];
 
         // Const row.
         let e0 = eq_inner[Z_CONST_POS];
@@ -699,7 +699,7 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
         comb[Z_CONST_POS] += e0;
 
         // Input self-loops for cv, m, counter, blen, flags.
-        let input_emit = |comb: &mut [F128], base: usize, len: usize| {
+        let input_emit = |comb: &mut [F256], base: usize, len: usize| {
             for j in 0..len {
                 let s = base + j;
                 let e = eq_inner[s];
@@ -972,7 +972,7 @@ pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool
 
 // ---------------------------------------------------------------------------
 // Fast witness generation with (a, b, c) — emits the R1CS row-witnesses
-// directly from the BLAKE3 computation, in F_{2^128}-packed form. Skips the
+// directly from the BLAKE3 computation, in F_{2^256}-packed form. Skips the
 // `apply_block_diag_packed` pass downstream.
 //
 // Row-witness semantics (matching `build_matrices`):
@@ -1021,7 +1021,7 @@ fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u6
 }
 
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
-/// of the F128-packed per-block storage. Buffers must be zero on entry.
+/// of the F256-packed per-block storage. Buffers must be zero on entry.
 ///
 /// **No c buffer.** Since `C = I` (this is the circuit-shape R1CS), `c == z`
 /// byte-for-byte; callers use `z_packed` directly as the c-side input to
@@ -1146,7 +1146,7 @@ fn build_block_witness_ab_packed_into(
     }
 }
 
-/// **The fast path.** Produces `(z, a, b)` directly as F_{2^128}-packed
+/// **The fast path.** Produces `(z, a, b)` directly as F_{2^256}-packed
 /// vectors — no bool intermediates, no `pack_witness` step, no
 /// `apply_block_diag_packed`. Parallel across compression instances via rayon.
 ///
@@ -1156,11 +1156,11 @@ pub fn generate_witness_with_ab_packed(
     blocks: &[Compression],
     n_blocks_log: usize,
 ) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F256>,
+    Vec<flock_core::field::F256>,
+    Vec<flock_core::field::F256>,
 ) {
-    use flock_core::field::F128;
+    use flock_core::field::F256;
     use rayon::prelude::*;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = blocks.len();
@@ -1169,20 +1169,20 @@ pub fn generate_witness_with_ab_packed(
         "{n_blocks} compressions > 2^{n_blocks_log} = {n_total} slots"
     );
 
-    const F128_PER_BLOCK: usize = K / 128;
-    let total_f128 = n_total * F128_PER_BLOCK;
-    let mut z = vec![F128::ZERO; total_f128];
-    let mut a = vec![F128::ZERO; total_f128];
-    let mut b = vec![F128::ZERO; total_f128];
+    const F256_PER_BLOCK: usize = K / 256;
+    let total_f256 = n_total * F256_PER_BLOCK;
+    let mut z = vec![F256::ZERO; total_f256];
+    let mut a = vec![F256::ZERO; total_f256];
+    let mut b = vec![F256::ZERO; total_f256];
 
     // Constant-wire pin (docs/const-wire-pin.md): padding slots get a valid
     // compression of the all-zero input (constant = 1), matching
     // [`generate_witness_with_ab_packed_and_lincheck`].
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
 
-    z.par_chunks_mut(F128_PER_BLOCK)
-        .zip(a.par_chunks_mut(F128_PER_BLOCK))
-        .zip(b.par_chunks_mut(F128_PER_BLOCK))
+    z.par_chunks_mut(F256_PER_BLOCK)
+        .zip(a.par_chunks_mut(F256_PER_BLOCK))
+        .zip(b.par_chunks_mut(F256_PER_BLOCK))
         .enumerate()
         .for_each(|(idx, ((z_c, a_c), b_c))| {
             let (cv, m, t, bl, fl) = if idx < n_blocks {
@@ -1190,16 +1190,16 @@ pub fn generate_witness_with_ab_packed(
             } else {
                 &padding
             };
-            // SAFETY: F128 is repr(C, align(16)) with LE u64 halves — same
-            // byte layout as a u64 pair.
+            // SAFETY: F256 is repr(C, align(32)) with four LE u64 words — same
+            // byte layout as a u64 quadruple.
             let z_u64: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(z_c.as_mut_ptr() as *mut u64, z_c.len() * 2)
+                std::slice::from_raw_parts_mut(z_c.as_mut_ptr() as *mut u64, z_c.len() * 4)
             };
             let a_u64: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(a_c.as_mut_ptr() as *mut u64, a_c.len() * 2)
+                std::slice::from_raw_parts_mut(a_c.as_mut_ptr() as *mut u64, a_c.len() * 4)
             };
             let b_u64: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(b_c.as_mut_ptr() as *mut u64, b_c.len() * 2)
+                std::slice::from_raw_parts_mut(b_c.as_mut_ptr() as *mut u64, b_c.len() * 4)
             };
             build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
         });
@@ -1224,9 +1224,9 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     blocks: &[Compression],
     n_blocks_log: usize,
 ) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F256>,
+    Vec<flock_core::field::F256>,
+    Vec<flock_core::field::F256>,
     Vec<u8>,
 ) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
@@ -1279,7 +1279,10 @@ impl Blake3Setup {
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(n_blocks: usize, profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
+    pub fn with_profile(
+        n_blocks: usize,
+        profile: flock_core::pcs::ligerito::LigeritoProfile,
+    ) -> Self {
         Self::with_profile_and_rate(n_blocks, profile, profile.log_inv_rate())
     }
 
@@ -1342,7 +1345,7 @@ impl Blake3Setup {
 
     /// Packed witness trace for the generic (matrix-driven) provers — see
     /// `Sha256HybridSetup::generate_witness_packed`.
-    pub fn generate_witness_packed(&self, blocks: &[Compression]) -> Vec<F128> {
+    pub fn generate_witness_packed(&self, blocks: &[Compression]) -> Vec<F256> {
         let (z_packed, _a, _b, _stripe) =
             generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log());
         z_packed
@@ -1362,7 +1365,7 @@ impl Blake3Setup {
     }
 
     /// Like [`Self::prove`] but emits `a`, `b`, `c` during witness gen
-    /// directly in F_{2^128}-packed form — no bool intermediates, no
+    /// directly in F_{2^256}-packed form — no bool intermediates, no
     /// `pack_witness`, no `apply_block_diag_packed`.
     ///
     pub fn prove_fast_basefold<Ch: Challenger>(
@@ -1652,6 +1655,7 @@ impl Blake3Setup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flock_core::field::F128;
 
     /// SplitMix64.
     struct Rng(u64);
@@ -1889,16 +1893,20 @@ mod tests {
         assert_eq!(sparse.n_cols(), walker.n_cols());
 
         let n_cols = walker.n_cols();
-        let alpha = F128 {
-            lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-            hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+        let mut rand_f256 = || {
+            F256::new(
+                F128 {
+                    lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                    hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                },
+                F128 {
+                    lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                    hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                },
+            )
         };
-        let eq_inner: Vec<F128> = (0..n_cols)
-            .map(|_| F128 {
-                lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-                hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-            })
-            .collect();
+        let alpha = rand_f256();
+        let eq_inner: Vec<F256> = (0..n_cols).map(|_| rand_f256()).collect();
 
         let expected = sparse.fold_alpha_batched(alpha, &eq_inner);
         let got = walker.fold_alpha_batched(alpha, &eq_inner);
@@ -2089,9 +2097,12 @@ mod tests {
         let zeros: Vec<Compression> = vec![([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32); n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_blocks_log());
-        z.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
-        a.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
-        b.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
+        z.iter_mut()
+            .for_each(|v| *v = flock_core::field::F256::ZERO);
+        a.iter_mut()
+            .for_each(|v| *v = flock_core::field::F256::ZERO);
+        b.iter_mut()
+            .for_each(|v| *v = flock_core::field::F256::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let mut ch_p = FsChallenger::new(b"poc");

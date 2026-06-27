@@ -88,9 +88,15 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
 
     let mut ch_v = FsChallenger::new(b"flock-lig-r1cs-v0");
     let lc_circuit = r1cs.sparse_lincheck_circuit();
-    let claim_v =
-        verifier::verify_ligerito(&r1cs, &commitment, &proof, &lc_circuit, &pcs_params, &mut ch_v)
-            .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
+    let claim_v = verifier::verify_ligerito(
+        &r1cs,
+        &commitment,
+        &proof,
+        &lc_circuit,
+        &pcs_params,
+        &mut ch_v,
+    )
+    .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
     assert_eq!(claim_p, claim_v);
 }
 
@@ -245,7 +251,7 @@ fn r1cs_verify_rejects_mutated_lincheck() {
     let mut ch_p = FsChallenger::new(b"flock-test-v0");
     let z_packed = pcs::pack_witness(&z, r1cs.m);
     let (mut proof, commitment, _) = prove(&r1cs, &z_packed, &pcs_params, &mut ch_p);
-    proof.lincheck.z_partial[0].lo ^= 1;
+    proof.lincheck.z_partial[0].c0.lo ^= 1;
 
     let mut ch_v = FsChallenger::new(b"flock-test-v0");
     let lc_circuit = r1cs.sparse_lincheck_circuit();
@@ -266,7 +272,7 @@ fn r1cs_verify_rejects_mutated_pcs() {
     let (mut proof, commitment, _) = prove(&r1cs, &z_packed, &pcs_params, &mut ch_p);
     // Mutate the BaseFold final_a in the batched opening — must trip
     // the final sumcheck consistency check.
-    proof.pcs_open.basefold.final_a.lo ^= 1;
+    proof.pcs_open.basefold.final_a.c0.lo ^= 1;
 
     let mut ch_v = FsChallenger::new(b"flock-test-v0");
     let lc_circuit = r1cs.sparse_lincheck_circuit();

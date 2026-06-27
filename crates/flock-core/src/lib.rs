@@ -100,6 +100,13 @@ pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
     alloc_uninit_vec::<crate::field::F128>(n)
 }
 
+/// Compatibility shim — same as `alloc_uninit_vec::<F256>(n)`. The F256
+/// analogue of [`alloc_uninit_f128_vec`] for the extension-field protocol
+/// buffers (codeword, fold scratch, ping-pong halves).
+pub(crate) fn alloc_uninit_f256_vec(n: usize) -> Vec<crate::field::F256> {
+    alloc_uninit_vec::<crate::field::F256>(n)
+}
+
 /// Cached [`perf_core_count`]. The uncached version may spawn `sysctl`; this
 /// memoizes it so hot paths can cheaply ask "is the current rayon pool the
 /// homogeneous P-core pool?" (i.e. `current_num_threads() <= this`).
@@ -120,10 +127,11 @@ fn perf_core_count() -> usize {
             .args(["-n", "hw.perflevel0.physicalcpu"])
             .output()
             && let Ok(s) = std::str::from_utf8(&out.stdout)
-                && let Ok(n) = s.trim().parse::<usize>()
-                    && n > 0 {
-                        return n;
-                    }
+            && let Ok(n) = s.trim().parse::<usize>()
+            && n > 0
+        {
+            return n;
+        }
     }
     std::thread::available_parallelism()
         .map(|n| n.get())

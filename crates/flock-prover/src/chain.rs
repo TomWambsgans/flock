@@ -58,7 +58,7 @@
 //! `ẑ`; the sumcheck (random `τ`, `α`) proves the glue + both endpoints at once.
 
 use flock_core::challenger::Challenger;
-use flock_core::field::F128;
+use flock_core::field::F256;
 use flock_core::lincheck::build_eq_table;
 use flock_core::zerocheck::multilinear::eq_eval;
 use serde::{Deserialize, Serialize};
@@ -75,25 +75,25 @@ use serde::{Deserialize, Serialize};
 /// ```
 ///
 /// Evaluated in `O(n)` via prefix/suffix products. `shift(1ⁿ, ·) = 0`.
-pub fn shift_mle(a: &[F128], b: &[F128]) -> F128 {
+pub fn shift_mle(a: &[F256], b: &[F256]) -> F256 {
     let n = a.len();
     assert_eq!(b.len(), n, "shift_mle: arity mismatch");
 
     // pre[j] = Π_{l<j} a_l·(1 + b_l)
-    let mut pre = vec![F128::ONE; n + 1];
+    let mut pre = vec![F256::ONE; n + 1];
     for j in 0..n {
-        pre[j + 1] = pre[j] * (a[j] * (F128::ONE + b[j]));
+        pre[j + 1] = pre[j] * (a[j] * (F256::ONE + b[j]));
     }
     // eqsuf[j] = Π_{l=j}^{n-1} eq(a_l, b_l)
-    let mut eqsuf = vec![F128::ONE; n + 1];
+    let mut eqsuf = vec![F256::ONE; n + 1];
     for j in (0..n).rev() {
-        let eq_l = F128::ONE + a[j] + b[j];
+        let eq_l = F256::ONE + a[j] + b[j];
         eqsuf[j] = eqsuf[j + 1] * eq_l;
     }
 
-    let mut acc = F128::ZERO;
+    let mut acc = F256::ZERO;
     for j in 0..n {
-        let mid = (F128::ONE + a[j]) * b[j]; // bit j flips 0 → 1
+        let mid = (F256::ONE + a[j]) * b[j]; // bit j flips 0 → 1
         acc += pre[j] * mid * eqsuf[j + 1]; // eqsuf[j+1] = Π_{l>j} eq
     }
     acc
@@ -107,9 +107,9 @@ pub struct ChainShiftProof {
     /// combined summand `W(y,s₀)·g(y,s₀)`. `q(0)` is recovered from the running
     /// claim via the sum rule. The initial claim `C = eq(τ,1ⁿ)·x_last +
     /// α·x_0(r)` is a *public* scalar the verifier forms itself.
-    pub rounds: Vec<(F128, F128)>,
+    pub rounds: Vec<(F256, F256)>,
     /// `g(τ', s₀*) = ẑ(τ', (0⁵,s₀*), r)` — the single folded opening value.
-    pub g_at_point: F128,
+    pub g_at_point: F256,
 }
 
 /// The single `ẑ`-evaluation claim the shift argument reduces to, for the PCS
@@ -120,11 +120,11 @@ pub struct ChainShiftProof {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainClaims {
     /// Instance coordinate `τ'` (length `n`).
-    pub instance_point: Vec<F128>,
+    pub instance_point: Vec<F256>,
     /// Merged selector-bit coordinate `s₀*` (picks `state_0` ↔ `state_24`).
-    pub sel0: F128,
+    pub sel0: F256,
     /// `g(τ', s₀*) = ẑ(τ', (0⁵,s₀*), r)`.
-    pub value: F128,
+    pub value: F256,
 }
 
 /// Errors the chain-shift verifier can raise.
@@ -139,9 +139,9 @@ pub enum ChainError {
 
 /// Inner product `Σ eq[i]·vals[i]` — used to spot-check claims in tests.
 #[cfg(test)]
-fn dot(eq: &[F128], vals: &[F128]) -> F128 {
+fn dot(eq: &[F256], vals: &[F256]) -> F256 {
     debug_assert_eq!(eq.len(), vals.len());
-    let mut acc = F128::ZERO;
+    let mut acc = F256::ZERO;
     for i in 0..eq.len() {
         acc += eq[i] * vals[i];
     }
@@ -153,8 +153,8 @@ fn dot(eq: &[F128], vals: &[F128]) -> F128 {
 /// (already folded over the per-instance bit index by the verifier's `r`).
 /// The transcript drives `τ`, `α`, and the sumcheck challenges (Fiat–Shamir).
 pub fn prove_chain_shift<Ch: Challenger>(
-    in_vals: &[F128],
-    out_vals: &[F128],
+    in_vals: &[F256],
+    out_vals: &[F256],
     challenger: &mut Ch,
 ) -> (ChainShiftProof, ChainClaims) {
     let n_total = in_vals.len();
@@ -163,15 +163,15 @@ pub fn prove_chain_shift<Ch: Challenger>(
     let n = n_total.trailing_zeros() as usize;
 
     // τ ∈ Fⁿ, then α — both before the sumcheck (mirrored by the verifier).
-    let tau = challenger.sample_f128_vec(n);
-    let alpha = challenger.sample_f128();
+    let tau = challenger.sample_f256_vec(n);
+    let alpha = challenger.sample_f256();
     let eqtau = build_eq_table(&tau); // eqtau[y] = eq(τ, y)
 
     // Weight table over (y, s₀), s₀ the HIGH bit: index y + s₀·N.
     //   s₀ = 0 (In side):  W(y,0) = shift(τ,y) + α·eq(y,0ⁿ)
     //                              = eq(τ,y−1) (y≥1) + α·[y==0]
     //   s₀ = 1 (Out side): W(y,1) = eq(τ,y)
-    let mut wt = vec![F128::ZERO; 2 * n_total];
+    let mut wt = vec![F256::ZERO; 2 * n_total];
     for y in 1..n_total {
         wt[y] = eqtau[y - 1]; // shift weight
     }
@@ -189,17 +189,17 @@ pub fn prove_chain_shift<Ch: Challenger>(
     let mut r_pts = Vec::with_capacity(d);
     for _ in 0..d {
         let half = g.len() / 2;
-        let mut e1 = F128::ZERO; // q(1)  = Σ W_hi·g_hi
-        let mut einf = F128::ZERO; // q(∞) = Σ ΔW·Δg
+        let mut e1 = F256::ZERO; // q(1)  = Σ W_hi·g_hi
+        let mut einf = F256::ZERO; // q(∞) = Σ ΔW·Δg
         for i in 0..half {
             let (wlo, whi) = (wt[i], wt[i + half]);
             let (glo, ghi) = (g[i], g[i + half]);
             e1 += whi * ghi;
             einf += (whi + wlo) * (ghi + glo);
         }
-        challenger.observe_f128(e1);
-        challenger.observe_f128(einf);
-        let r = challenger.sample_f128();
+        challenger.observe_f256(e1);
+        challenger.observe_f256(einf);
+        let r = challenger.sample_f256();
         // Fold (bind the top remaining variable): lo + r·(hi+lo).
         for i in 0..half {
             wt[i] = wt[i] + r * (wt[i + half] + wt[i]);
@@ -214,7 +214,7 @@ pub fn prove_chain_shift<Ch: Challenger>(
     // After n+1 folds, g[0] = g(τ', s₀*) — the single opening value. Build the
     // claim point identically to the verifier: full[d-1-k] = r_pts[k] (bit d-1
     // = s₀, the HIGH bit); τ' = full[..n], s₀* = full[n].
-    let mut full = vec![F128::ZERO; d];
+    let mut full = vec![F256::ZERO; d];
     for (k, &r) in r_pts.iter().enumerate() {
         full[d - 1 - k] = r;
     }
@@ -237,8 +237,8 @@ pub fn prove_chain_shift<Ch: Challenger>(
 /// `In`/`Out`). Returns the single `ẑ`-evaluation claim for the PCS layer.
 pub fn verify_chain_shift<Ch: Challenger>(
     proof: &ChainShiftProof,
-    x0_r: F128,
-    xlast_r: F128,
+    x0_r: F256,
+    xlast_r: F256,
     n: usize,
     challenger: &mut Ch,
 ) -> Result<ChainClaims, ChainError> {
@@ -249,17 +249,17 @@ pub fn verify_chain_shift<Ch: Challenger>(
 
     // Resample τ, α. The initial claim is the *public* scalar
     //   C = eq(τ,1ⁿ)·x_last + α·x_0(r),     eq(τ,1ⁿ) = Π_j τ_j.
-    let tau = challenger.sample_f128_vec(n);
-    let alpha = challenger.sample_f128();
-    let eq_tau_ones = tau.iter().copied().fold(F128::ONE, |acc, t| acc * t);
+    let tau = challenger.sample_f256_vec(n);
+    let alpha = challenger.sample_f256();
+    let eq_tau_ones = tau.iter().copied().fold(F256::ONE, |acc, t| acc * t);
     let mut claim = eq_tau_ones * xlast_r + alpha * x0_r;
 
     // Replay the combined sumcheck (n+1 rounds).
     let mut r_pts = Vec::with_capacity(d);
     for &(e1, einf) in &proof.rounds {
-        challenger.observe_f128(e1);
-        challenger.observe_f128(einf);
-        let r = challenger.sample_f128();
+        challenger.observe_f256(e1);
+        challenger.observe_f256(einf);
+        let r = challenger.sample_f256();
         // q(0) = claim − q(1) = claim + e1 (char 2). Degree-2 poly through
         // (0,e0),(1,e1),(∞→einf): q(X) = einf·X² + c1·X + e0, c1 = e0+e1+einf.
         let e0 = claim + e1;
@@ -269,20 +269,20 @@ pub fn verify_chain_shift<Ch: Challenger>(
     }
 
     // Full point LSB-first (bit d−1 = s₀, the HIGH bit): r_pts[k] bound bit d−1−k.
-    let mut full = vec![F128::ZERO; d];
+    let mut full = vec![F256::ZERO; d];
     for (k, &r) in r_pts.iter().enumerate() {
         full[d - 1 - k] = r;
     }
-    let taup: Vec<F128> = full[..n].to_vec(); // τ' (instance coords)
+    let taup: Vec<F256> = full[..n].to_vec(); // τ' (instance coords)
     let s0 = full[n]; // s₀*
 
     // Final weight W(τ', s₀*) (verifier-computed):
     //   shift(τ,τ')·(1+s₀) + eq(τ,τ')·s₀ + α·eq(τ',0ⁿ)·(1+s₀).
     let s = shift_mle(&tau, &taup);
     let eq_tt = eq_eval(&tau, &taup);
-    let zero_n = vec![F128::ZERO; n];
+    let zero_n = vec![F256::ZERO; n];
     let eq_t0 = eq_eval(&taup, &zero_n); // eq(τ', 0ⁿ) = Π_j (1+τ'_j)
-    let one_plus_s0 = F128::ONE + s0;
+    let one_plus_s0 = F256::ONE + s0;
     let w_final = s * one_plus_s0 + eq_tt * s0 + alpha * eq_t0 * one_plus_s0;
 
     if claim != w_final * proof.g_at_point {
@@ -297,26 +297,30 @@ pub fn verify_chain_shift<Ch: Challenger>(
 }
 
 // ---------------------------------------------------------------------------
-// Region fold (Step 0): collapse a per-instance region of ẑ to one F128 each.
+// Region fold (Step 0): collapse a per-instance region of ẑ to one F256 each.
 // ---------------------------------------------------------------------------
 
 /// Read logical bit `g` of the packed witness. Convention (see `pcs::pack`):
-/// bit `i_skip` of `packed[i_rest]` is global bit `i_rest·128 + i_skip`.
+/// bit `i_skip` of `packed[i_rest]` is global bit `i_rest·256 + i_skip`.
 #[inline]
-pub fn read_packed_bit(packed: &[F128], g: usize) -> bool {
-    let elem = packed[g >> 7];
-    let i_skip = g & 127;
+pub fn read_packed_bit(packed: &[F256], g: usize) -> bool {
+    let elem = packed[g >> 8];
+    let i_skip = g & 255;
     if i_skip < 64 {
-        (elem.lo >> i_skip) & 1 == 1
+        (elem.c0.lo >> i_skip) & 1 == 1
+    } else if i_skip < 128 {
+        (elem.c0.hi >> (i_skip - 64)) & 1 == 1
+    } else if i_skip < 192 {
+        (elem.c1.lo >> (i_skip - 128)) & 1 == 1
     } else {
-        (elem.hi >> (i_skip - 64)) & 1 == 1
+        (elem.c1.hi >> (i_skip - 192)) & 1 == 1
     }
 }
 
 /// **Naive region fold.** Collapse one per-instance region of the committed
-/// witness `ẑ` to a single `F128` per instance.
+/// witness `ẑ` to a single `F256` per instance.
 ///
-/// `packed` is `ẑ` in PCS-packed form (length `2^(m−7)`). `k_log` is the number
+/// `packed` is `ẑ` in PCS-packed form (length `2^(m−8)`). `k_log` is the number
 /// of inner (within-block) variables, so instance `i` occupies global bits
 /// `[i·2^k_log, (i+1)·2^k_log)` and there are `2^n = 2^(m−k_log)` instances.
 /// `taps[t] = (pos, w)` says region bit `t` lives at within-block position `pos`
@@ -327,8 +331,8 @@ pub fn read_packed_bit(packed: &[F128], g: usize) -> bool {
 ///
 /// This is the correctness oracle; an optimized lane-batched version (mirroring
 /// the zerocheck `c`-extraction) will replace it on the hot path.
-pub fn fold_region_naive(packed: &[F128], k_log: usize, taps: &[(usize, F128)]) -> Vec<F128> {
-    let total_bits = packed.len() << 7;
+pub fn fold_region_naive(packed: &[F256], k_log: usize, taps: &[(usize, F256)]) -> Vec<F256> {
+    let total_bits = packed.len() << 8;
     let block = 1usize << k_log;
     assert!(
         total_bits.is_multiple_of(block),
@@ -339,7 +343,7 @@ pub fn fold_region_naive(packed: &[F128], k_log: usize, taps: &[(usize, F128)]) 
     (0..n_inst)
         .map(|i| {
             let block_base = i * block;
-            let mut acc = F128::ZERO;
+            let mut acc = F256::ZERO;
             for &(pos, w) in taps {
                 if read_packed_bit(packed, block_base + pos) {
                     acc += w;
@@ -367,11 +371,11 @@ pub fn fold_region_naive(packed: &[F128], k_log: usize, taps: &[(usize, F128)]) 
 /// Parallel over instances. Result is identical to [`fold_region_naive`] with
 /// taps `(byte_off·8 + p, region_weights[p])`.
 pub fn fold_contiguous_regions(
-    packed: &[F128],
+    packed: &[F256],
     k_log: usize,
     region_byte_offsets: &[usize],
-    region_weights: &[F128],
-) -> Vec<Vec<F128>> {
+    region_weights: &[F256],
+) -> Vec<Vec<F256>> {
     use rayon::prelude::*;
 
     let region_bits = region_weights.len();
@@ -384,7 +388,7 @@ pub fn fold_contiguous_regions(
     let block = 1usize << k_log;
     assert!(block.is_multiple_of(8), "block must be byte-aligned");
     let block_bytes = block / 8;
-    let total_bits = packed.len() << 7;
+    let total_bits = packed.len() << 8;
     assert!(
         total_bits.is_multiple_of(block),
         "packed witness not a whole number of blocks"
@@ -392,7 +396,7 @@ pub fn fold_contiguous_regions(
     let n_inst = total_bits >> k_log;
 
     // Subset-sum byte tables: tab[bo][v] = Σ weights at set bits of v.
-    let mut tab = vec![[F128::ZERO; 256]; n_bytes];
+    let mut tab = vec![[F256::ZERO; 256]; n_bytes];
     for bo in 0..n_bytes {
         let t = &mut tab[bo];
         for v in 1usize..256 {
@@ -402,21 +406,21 @@ pub fn fold_contiguous_regions(
         }
     }
 
-    // SAFETY: F128 is repr(C, align(16)) = two LE u64s, so byte B of this view
+    // SAFETY: F256 is repr(C, align(32)) = four LE u64s, so byte B of this view
     // holds logical bits [8B, 8B+8); bit (8B+r) = (byte >> r) & 1.
     let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(packed.as_ptr() as *const u8, packed.len() * 16) };
+        unsafe { std::slice::from_raw_parts(packed.as_ptr() as *const u8, packed.len() * 32) };
 
     // Single par_iter over instances producing one length-`n_regions` row per
     // instance — fuses what was previously N sequential `(par_iter).collect()`
     // passes into one rayon dispatch, and lets the per-byte `tab[bo][..]` reads
     // stay hot in L1 across all regions of the same instance.
     let n_regions = region_byte_offsets.len();
-    let flat: Vec<F128> = (0..n_inst)
+    let flat: Vec<F256> = (0..n_inst)
         .into_par_iter()
         .flat_map_iter(|i| {
             let instance_base = i * block_bytes;
-            let mut row = [F128::ZERO; 8]; // supports up to 8 regions; matches realistic chain layouts
+            let mut row = [F256::ZERO; 8]; // supports up to 8 regions; matches realistic chain layouts
             assert!(
                 n_regions <= row.len(),
                 "fold_contiguous_regions: too many regions"
@@ -442,6 +446,7 @@ pub fn fold_contiguous_regions(
 mod tests {
     use super::*;
     use flock_core::challenger::RandomChallenger;
+    use flock_core::field::F128;
 
     /// SplitMix64-ish RNG for test data.
     struct Rng(u64);
@@ -456,48 +461,52 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             z ^ (z >> 31)
         }
-        fn f128(&mut self) -> F128 {
-            F128 {
-                lo: self.next_u64(),
-                hi: self.next_u64(),
-            }
+        fn f256(&mut self) -> F256 {
+            F256::new(
+                F128 {
+                    lo: self.next_u64(),
+                    hi: self.next_u64(),
+                },
+                F128 {
+                    lo: self.next_u64(),
+                    hi: self.next_u64(),
+                },
+            )
         }
-        fn f128_vec(&mut self, n: usize) -> Vec<F128> {
-            (0..n).map(|_| self.f128()).collect()
+        fn f256_vec(&mut self, n: usize) -> Vec<F256> {
+            (0..n).map(|_| self.f256()).collect()
         }
     }
 
-    /// Build an LSB-first boolean point as F128 (0/1) of length `n` from index.
-    fn bool_point(idx: usize, n: usize) -> Vec<F128> {
+    /// Build an LSB-first boolean point as F256 (0/1) of length `n` from index.
+    fn bool_point(idx: usize, n: usize) -> Vec<F256> {
         (0..n)
             .map(|j| {
                 if (idx >> j) & 1 == 1 {
-                    F128::ONE
+                    F256::ONE
                 } else {
-                    F128::ZERO
+                    F256::ZERO
                 }
             })
             .collect()
     }
 
     /// Pack a bool witness the way `pcs::pack` does (bit i_skip of out[i_rest] =
-    /// z[i_rest·128 + i_skip]).
-    fn pack(z: &[bool]) -> Vec<F128> {
-        assert!(z.len().is_multiple_of(128));
-        (0..z.len() / 128)
+    /// z[i_rest·256 + i_skip]).
+    fn pack(z: &[bool]) -> Vec<F256> {
+        assert!(z.len().is_multiple_of(256));
+        (0..z.len() / 256)
             .map(|i_rest| {
-                let base = i_rest * 128;
-                let mut lo = 0u64;
-                let mut hi = 0u64;
-                for r in 0..64 {
-                    if z[base + r] {
-                        lo |= 1 << r;
-                    }
-                    if z[base + 64 + r] {
-                        hi |= 1 << r;
+                let base = i_rest * 256;
+                let mut w = [0u64; 4];
+                for (word, chunk) in w.iter_mut().enumerate() {
+                    for r in 0..64 {
+                        if z[base + 64 * word + r] {
+                            *chunk |= 1 << r;
+                        }
                     }
                 }
-                F128 { lo, hi }
+                F256::new(F128 { lo: w[0], hi: w[1] }, F128 { lo: w[2], hi: w[3] })
             })
             .collect()
     }
@@ -516,12 +525,12 @@ mod tests {
         let packed = pack(&z);
 
         // Random taps: 10 region bits at distinct in-block positions, random w.
-        let taps: Vec<(usize, F128)> = (0..10).map(|t| (3 * t % block, rng.f128())).collect();
+        let taps: Vec<(usize, F256)> = (0..10).map(|t| (3 * t % block, rng.f256())).collect();
 
         let got = fold_region_naive(&packed, k_log, &taps);
         assert_eq!(got.len(), 1 << n);
         for i in 0..(1 << n) {
-            let mut want = F128::ZERO;
+            let mut want = F256::ZERO;
             for &(pos, w) in &taps {
                 if z[i * block + pos] {
                     want += w;
@@ -545,14 +554,14 @@ mod tests {
 
         // Region: 16 contiguous bits = 2 bytes, with random weights.
         let region_bits = 16;
-        let weights: Vec<F128> = (0..region_bits).map(|_| rng.f128()).collect();
+        let weights: Vec<F256> = (0..region_bits).map(|_| rng.f256()).collect();
 
         // Test with N regions at distinct byte-aligned offsets.
         for &offs in &[&[0usize] as &[usize], &[0, 2], &[0, 2, 4]] {
             let got = fold_contiguous_regions(&packed, k_log, offs, &weights);
             assert_eq!(got.len(), offs.len());
             for (r_idx, &off) in offs.iter().enumerate() {
-                let taps: Vec<(usize, F128)> = (0..region_bits)
+                let taps: Vec<(usize, F256)> = (0..region_bits)
                     .map(|p| (off * 8 + p, weights[p]))
                     .collect();
                 let want = fold_region_naive(&packed, k_log, &taps);
@@ -571,7 +580,7 @@ mod tests {
                     let av = bool_point(a, n);
                     let bv = bool_point(b, n);
                     let got = shift_mle(&av, &bv);
-                    let want = if b == a + 1 { F128::ONE } else { F128::ZERO };
+                    let want = if b == a + 1 { F256::ONE } else { F256::ZERO };
                     assert_eq!(got, want, "shift({a},{b}) n={n}");
                 }
             }
@@ -584,8 +593,8 @@ mod tests {
         let mut rng = Rng::new(7);
         for n in 1..=5 {
             let a = bool_point((1 << n) - 1, n);
-            let b = rng.f128_vec(n);
-            assert_eq!(shift_mle(&a, &b), F128::ZERO);
+            let b = rng.f256_vec(n);
+            assert_eq!(shift_mle(&a, &b), F256::ZERO);
         }
     }
 
@@ -595,12 +604,12 @@ mod tests {
         let mut rng = Rng::new(11);
         for n in 1..=5 {
             let n_total = 1usize << n;
-            let tau = rng.f128_vec(n);
+            let tau = rng.f256_vec(n);
             let eqtau = build_eq_table(&tau);
             for y in 0..n_total {
                 let yv = bool_point(y, n);
                 let got = shift_mle(&tau, &yv);
-                let want = if y == 0 { F128::ZERO } else { eqtau[y - 1] };
+                let want = if y == 0 { F256::ZERO } else { eqtau[y - 1] };
                 assert_eq!(got, want, "y={y} n={n}");
             }
         }
@@ -615,9 +624,9 @@ mod tests {
             let n_total = 1usize << n;
             let mut rng = Rng::new(100 + n as u64);
             // x_0 .. x_N  (N+1 chain values); In[i]=x_i, Out[i]=x_{i+1}.
-            let chain: Vec<F128> = rng.f128_vec(n_total + 1);
-            let in_vals: Vec<F128> = chain[..n_total].to_vec();
-            let out_vals: Vec<F128> = chain[1..].to_vec();
+            let chain: Vec<F256> = rng.f256_vec(n_total + 1);
+            let in_vals: Vec<F256> = chain[..n_total].to_vec();
+            let out_vals: Vec<F256> = chain[1..].to_vec();
             let x0_r = chain[0];
             let xlast_r = chain[n_total];
 
@@ -631,7 +640,7 @@ mod tests {
             let eq_taup = build_eq_table(&claims.instance_point);
             let in_true = dot(&eq_taup, &in_vals);
             let out_true = dot(&eq_taup, &out_vals);
-            let g_true = (F128::ONE + claims.sel0) * in_true + claims.sel0 * out_true;
+            let g_true = (F256::ONE + claims.sel0) * in_true + claims.sel0 * out_true;
             assert_eq!(claims.value, g_true, "merged claim n={n}");
         }
     }
@@ -642,14 +651,14 @@ mod tests {
         let n = 6;
         let n_total = 1usize << n;
         let mut rng = Rng::new(2024);
-        let chain: Vec<F128> = rng.f128_vec(n_total + 1);
-        let in_vals: Vec<F128> = chain[..n_total].to_vec();
-        let mut out_vals: Vec<F128> = chain[1..].to_vec();
+        let chain: Vec<F256> = rng.f256_vec(n_total + 1);
+        let in_vals: Vec<F256> = chain[..n_total].to_vec();
+        let mut out_vals: Vec<F256> = chain[1..].to_vec();
         let x0_r = chain[0];
         let xlast_r = chain[n_total];
 
         // Break the glue: Out[3] no longer equals In[4].
-        out_vals[3] += F128::ONE;
+        out_vals[3] += F256::ONE;
 
         let mut chp = RandomChallenger::new(9);
         let (proof, _claims) = prove_chain_shift(&in_vals, &out_vals, &mut chp);
@@ -665,11 +674,11 @@ mod tests {
         let n = 5;
         let n_total = 1usize << n;
         let mut rng = Rng::new(555);
-        let chain: Vec<F128> = rng.f128_vec(n_total + 1);
-        let in_vals: Vec<F128> = chain[..n_total].to_vec();
-        let out_vals: Vec<F128> = chain[1..].to_vec();
+        let chain: Vec<F256> = rng.f256_vec(n_total + 1);
+        let in_vals: Vec<F256> = chain[..n_total].to_vec();
+        let out_vals: Vec<F256> = chain[1..].to_vec();
         let xlast_r = chain[n_total];
-        let wrong_x0 = chain[0] + F128::ONE;
+        let wrong_x0 = chain[0] + F256::ONE;
 
         let mut chp = RandomChallenger::new(3);
         let (proof, _claims) = prove_chain_shift(&in_vals, &out_vals, &mut chp);
@@ -684,11 +693,11 @@ mod tests {
         let n = 5;
         let n_total = 1usize << n;
         let mut rng = Rng::new(777);
-        let chain: Vec<F128> = rng.f128_vec(n_total + 1);
-        let in_vals: Vec<F128> = chain[..n_total].to_vec();
-        let out_vals: Vec<F128> = chain[1..].to_vec();
+        let chain: Vec<F256> = rng.f256_vec(n_total + 1);
+        let in_vals: Vec<F256> = chain[..n_total].to_vec();
+        let out_vals: Vec<F256> = chain[1..].to_vec();
         let x0_r = chain[0];
-        let wrong_xlast = chain[n_total] + F128::ONE;
+        let wrong_xlast = chain[n_total] + F256::ONE;
 
         let mut chp = RandomChallenger::new(1);
         let (proof, _claims) = prove_chain_shift(&in_vals, &out_vals, &mut chp);

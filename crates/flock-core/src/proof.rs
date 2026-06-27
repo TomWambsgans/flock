@@ -5,7 +5,7 @@
 //! produces these structs; the verifier consumes them.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::F256;
 use crate::lincheck::{self, QuirkyPoint};
 use crate::pcs::{self, Commitment};
 use crate::r1cs::BlockR1cs;
@@ -36,7 +36,7 @@ pub struct R1csProofLigerito {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZClaim {
     pub point: QuirkyPoint,
-    pub value: F128,
+    pub value: F256,
 }
 
 /// Two MLE evaluation claims on `z` that the PCS layer must verify.

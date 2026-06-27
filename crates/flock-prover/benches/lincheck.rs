@@ -7,7 +7,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::lincheck::{QuirkyPoint, SparseMatrixCircuit, prove};
 use flock_prover::r1cs::SparseBinaryMatrix;
 
@@ -26,14 +26,20 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
-        }
+    fn f256(&mut self) -> F256 {
+        F256::new(
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+        )
     }
-    fn f128_vec(&mut self, n: usize) -> Vec<F128> {
-        (0..n).map(|_| self.f128()).collect()
+    fn f256_vec(&mut self, n: usize) -> Vec<F256> {
+        (0..n).map(|_| self.f256()).collect()
     }
     fn fill_bytes(&mut self, buf: &mut [u8]) {
         let len = buf.len();
@@ -111,9 +117,9 @@ fn main() {
             let mut z_packed = vec![0u8; n_bytes];
             rng.fill_bytes(&mut z_packed);
             let x_ab = QuirkyPoint {
-                z_skip: rng.f128(),
-                x_inner_rest: rng.f128_vec(K_LOG - K_SKIP),
-                x_outer: rng.f128_vec(m - K_LOG),
+                z_skip: rng.f256(),
+                x_inner_rest: rng.f256_vec(K_LOG - K_SKIP),
+                x_outer: rng.f256_vec(m - K_LOG),
             };
             witnesses.push((z_packed, x_ab));
         }
@@ -150,7 +156,7 @@ fn main() {
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
             println!("  {:<40} {:>10.2} ms", label, elapsed);
             best_ms = best_ms.min(elapsed);
-            cs ^= proof.z_partial[0].lo ^ claim.w.lo;
+            cs ^= proof.z_partial[0].c0.lo ^ claim.w.c0.lo;
         }
         if n_runs > 1 {
             println!("  {:<40} {:>10.2} ms", "  (best)", best_ms);

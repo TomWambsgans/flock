@@ -32,7 +32,7 @@
 //! polynomial.
 
 use flock_core::challenger::Challenger;
-use flock_core::field::F128;
+use flock_core::field::{F128, F256};
 use flock_core::lincheck::build_eq_table;
 use flock_core::zerocheck::multilinear::eq_eval;
 use serde::{Deserialize, Serialize};
@@ -82,23 +82,23 @@ impl SlotLayout {
 /// `0` is recovered from the running claim via `q(0) = C - q(1)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundMsg {
-    pub q_1: F128,
-    pub q_omega: F128,
-    pub q_omega_plus_1: F128,
+    pub q_1: F256,
+    pub q_omega: F256,
+    pub q_omega_plus_1: F256,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerklePathShiftProof {
     pub rounds: Vec<RoundMsg>, // length n + 2
-    pub g_at_point: F128,
+    pub g_at_point: F256,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MerklePathClaims {
-    pub instance_point: Vec<F128>, // (r_{y_0}, ..., r_{y_{n-1}})
-    pub sel_slot: F128,
-    pub side: F128,
-    pub value: F128,
+    pub instance_point: Vec<F256>, // (r_{y_0}, ..., r_{y_{n-1}})
+    pub sel_slot: F256,
+    pub side: F256,
+    pub value: F256,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,11 +114,14 @@ pub enum MerklePathError {
 /// `ω` — the polynomial `X` in `F_2[X]/p(X)`. Distinct from 0 and 1, so
 /// `{0, 1, ω, ω+1}` are four distinct field points usable for degree-3
 /// Lagrange interpolation.
-const OMEGA: F128 = F128 { lo: 2, hi: 0 };
+const OMEGA: F256 = F256 {
+    c0: F128 { lo: 2, hi: 0 },
+    c1: F128 { lo: 0, hi: 0 },
+};
 
 #[inline]
-fn omega_plus_1() -> F128 {
-    OMEGA + F128::ONE
+fn omega_plus_1() -> F256 {
+    OMEGA + F256::ONE
 }
 
 // ---------------------------------------------------------------------------
@@ -127,13 +130,13 @@ fn omega_plus_1() -> F128 {
 
 #[inline]
 fn lagrange_eval_degree3(
-    q_0: F128,
-    q_1: F128,
-    q_omega: F128,
-    q_omega_plus_1: F128,
-    r: F128,
-) -> F128 {
-    let one = F128::ONE;
+    q_0: F256,
+    q_1: F256,
+    q_omega: F256,
+    q_omega_plus_1: F256,
+    r: F256,
+) -> F256 {
+    let one = F256::ONE;
     let omega = OMEGA;
     let opo = omega_plus_1();
 
@@ -170,11 +173,11 @@ fn lagrange_eval_degree3(
 /// δ_S(ss, sd) for slot `s = ss_target | (sd_target << 1)`. Each is a product
 /// of two char-2 multilinear basis polynomials.
 #[inline]
-fn slot_indicator(target_slot: u8, ss: F128, sd: F128) -> F128 {
+fn slot_indicator(target_slot: u8, ss: F256, sd: F256) -> F256 {
     let ss_target = target_slot & 1;
     let sd_target = (target_slot >> 1) & 1;
-    let ss_part = if ss_target == 1 { ss } else { F128::ONE + ss };
-    let sd_part = if sd_target == 1 { sd } else { F128::ONE + sd };
+    let ss_part = if ss_target == 1 { ss } else { F256::ONE + ss };
+    let sd_part = if sd_target == 1 { sd } else { F256::ONE + sd };
     ss_part * sd_part
 }
 
@@ -183,7 +186,7 @@ fn slot_indicator(target_slot: u8, ss: F128, sd: F128) -> F128 {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn shift_mle(a: &[F128], b: &[F128]) -> F128 {
+fn shift_mle(a: &[F256], b: &[F256]) -> F256 {
     crate::chain::shift_mle(a, b)
 }
 
@@ -191,9 +194,9 @@ fn shift_mle(a: &[F128], b: &[F128]) -> F128 {
 // Bit MLE evaluator (naive O(K))
 // ---------------------------------------------------------------------------
 
-fn eval_bit_mle(b_bits: &[bool], r: &[F128]) -> F128 {
+fn eval_bit_mle(b_bits: &[bool], r: &[F256]) -> F256 {
     let eq_r = build_eq_table(r);
-    let mut acc = F128::ZERO;
+    let mut acc = F256::ZERO;
     for (y, &bit) in b_bits.iter().enumerate() {
         if bit {
             acc += eq_r[y];
@@ -225,10 +228,10 @@ fn eval_bit_mle(b_bits: &[bool], r: &[F128]) -> F128 {
 #[allow(clippy::too_many_arguments)]
 pub fn prove_merkle_path_shift<Ch: Challenger>(
     path_log: usize,
-    x_l_vals: &[F128],
-    x_r_vals: &[F128],
-    z_vals: &[F128],
-    iv_vals: &[F128],
+    x_l_vals: &[F256],
+    x_r_vals: &[F256],
+    z_vals: &[F256],
+    iv_vals: &[F256],
     b_bits: &[bool],
     layout: SlotLayout,
     challenger: &mut Ch,
@@ -247,8 +250,8 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     let n_pos = 1usize << pos_log;
 
     // τ, α (transcript-driven, mirrored by verifier).
-    let tau = challenger.sample_f128_vec(n);
-    let alpha = challenger.sample_f128();
+    let tau = challenger.sample_f256_vec(n);
+    let alpha = challenger.sample_f256();
     // LSB-first split: τ = (τ_q ‖ τ_p) where bits 0..pos_log are the position
     // (within-path) coordinates and bits pos_log..n are the path-id coordinates.
     let tau_q = &tau[..pos_log];
@@ -264,30 +267,30 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     // where shift_q(0) = 0 and shift_q(i_q) = eq(τ_q, i_q - 1) for i_q ≥ 1.
     // For path_log=0: eq_tau_p[0] = 1 and this reduces to
     //   shift(τ, y) + α · δ(y = 0) — the single-path formula.
-    let mut t_shift_alpha = vec![F128::ZERO; n_total];
+    let mut t_shift_alpha = vec![F256::ZERO; n_total];
     for i_p in 0..n_paths {
         let weight_p = eq_tau_p[i_p];
         let row_base = i_p << pos_log;
         for i_q in 0..n_pos {
             let shift_iq = if i_q == 0 {
-                F128::ZERO
+                F256::ZERO
             } else {
                 eq_tau_q[i_q - 1]
             };
-            let leaf_iq = if i_q == 0 { alpha } else { F128::ZERO };
+            let leaf_iq = if i_q == 0 { alpha } else { F256::ZERO };
             t_shift_alpha[row_base | i_q] = weight_p * (shift_iq + leaf_iq);
         }
     }
     let mut t_eq = eq_tau.clone();
-    let mut t_b: Vec<F128> = b_bits
+    let mut t_b: Vec<F256> = b_bits
         .iter()
-        .map(|&b| if b { F128::ONE } else { F128::ZERO })
+        .map(|&b| if b { F256::ONE } else { F256::ZERO })
         .collect();
     // First row of every path has B := 0 by convention (the path's leaf goes
     // into the in_L slot of its first hash). For path_log=0 this is just
     // B(0) := 0 — the single-path convention.
     for i_p in 0..n_paths {
-        t_b[i_p << pos_log] = F128::ZERO;
+        t_b[i_p << pos_log] = F256::ZERO;
     }
 
     // Per-slot g tables (length 2^n each). Folded independently through y rounds.
@@ -309,20 +312,20 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     // where T[X,y_rem] := T_lo[y_rem] + X · (T_hi[y_rem] + T_lo[y_rem]).
 
     let mut rounds: Vec<RoundMsg> = Vec::with_capacity(n + 2);
-    let mut r_pts: Vec<F128> = Vec::with_capacity(n + 2);
-    let eval_pts = [F128::ONE, OMEGA, omega_plus_1()];
+    let mut r_pts: Vec<F256> = Vec::with_capacity(n + 2);
+    let eval_pts = [F256::ONE, OMEGA, omega_plus_1()];
 
     for _round_idx in 0..n {
         let half = t_b.len() / 2;
-        let mut sums = [F128::ZERO; 3];
+        let mut sums = [F256::ZERO; 3];
 
         for (e, &xx) in eval_pts.iter().enumerate() {
-            let mut acc = F128::ZERO;
+            let mut acc = F256::ZERO;
             for i in 0..half {
                 let ta = t_shift_alpha[i] + xx * (t_shift_alpha[i + half] + t_shift_alpha[i]);
                 let te = t_eq[i] + xx * (t_eq[i + half] + t_eq[i]);
                 let tb = t_b[i] + xx * (t_b[i + half] + t_b[i]);
-                let one_plus_tb = F128::ONE + tb;
+                let one_plus_tb = F256::ONE + tb;
 
                 let gz = g_z[i] + xx * (g_z[i + half] + g_z[i]);
                 let gxl = g_xl[i] + xx * (g_xl[i + half] + g_xl[i]);
@@ -338,10 +341,10 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
             q_omega: sums[1],
             q_omega_plus_1: sums[2],
         };
-        challenger.observe_f128(msg.q_1);
-        challenger.observe_f128(msg.q_omega);
-        challenger.observe_f128(msg.q_omega_plus_1);
-        let r = challenger.sample_f128();
+        challenger.observe_f256(msg.q_1);
+        challenger.observe_f256(msg.q_omega);
+        challenger.observe_f256(msg.q_omega_plus_1);
+        let r = challenger.sample_f256();
         rounds.push(msg);
         r_pts.push(r);
 
@@ -368,7 +371,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     let ta = t_shift_alpha[0];
     let te = t_eq[0];
     let tb = t_b[0];
-    let one_plus_tb = F128::ONE + tb;
+    let one_plus_tb = F256::ONE + tb;
 
     // ------------------------------------------------------------------
     // 2 slot rounds: build 4-element W, g over (ss, sd) and run a standard
@@ -381,8 +384,8 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     //
     // W is non-zero at three slot positions (Z, X_L, X_R) and zero at "other".
 
-    let mut w_table = [F128::ZERO; 4];
-    let mut g_table = [F128::ZERO; 4];
+    let mut w_table = [F256::ZERO; 4];
+    let mut g_table = [F256::ZERO; 4];
     let z_slot = layout.z_slot as usize;
     let xl_slot = layout.x_l_slot as usize;
     let xr_slot = layout.x_r_slot as usize;
@@ -402,9 +405,9 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     // sd round (high bit), then ss round.
     for _round_idx in 0..2 {
         let half = w_vec.len() / 2;
-        let mut sums = [F128::ZERO; 3];
+        let mut sums = [F256::ZERO; 3];
         for (e, &xx) in eval_pts.iter().enumerate() {
-            let mut acc = F128::ZERO;
+            let mut acc = F256::ZERO;
             for i in 0..half {
                 let w_at_xx = w_vec[i] + xx * (w_vec[i + half] + w_vec[i]);
                 let g_at_xx = g_vec[i] + xx * (g_vec[i + half] + g_vec[i]);
@@ -417,10 +420,10 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
             q_omega: sums[1],
             q_omega_plus_1: sums[2],
         };
-        challenger.observe_f128(msg.q_1);
-        challenger.observe_f128(msg.q_omega);
-        challenger.observe_f128(msg.q_omega_plus_1);
-        let r = challenger.sample_f128();
+        challenger.observe_f256(msg.q_1);
+        challenger.observe_f256(msg.q_omega);
+        challenger.observe_f256(msg.q_omega_plus_1);
+        let r = challenger.sample_f256();
         rounds.push(msg);
         r_pts.push(r);
         for i in 0..half {
@@ -439,7 +442,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     //                       y-block, i.e. r_pts[n - 1 - j].
     //   sd = r_pts[n]
     //   ss = r_pts[n + 1]
-    let mut instance_point = vec![F128::ZERO; n];
+    let mut instance_point = vec![F256::ZERO; n];
     for j in 0..n {
         instance_point[j] = r_pts[n - 1 - j];
     }
@@ -469,8 +472,8 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
 pub fn verify_merkle_path_shift<Ch: Challenger>(
     path_log: usize,
     proof: &MerklePathShiftProof,
-    leaf_evals: &[F128],
-    root_r: F128,
+    leaf_evals: &[F256],
+    root_r: F256,
     b_bits: &[bool],
     n: usize,
     layout: SlotLayout,
@@ -492,8 +495,8 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     );
 
     // Resample τ, α (mirror prover).
-    let tau = challenger.sample_f128_vec(n);
-    let alpha = challenger.sample_f128();
+    let tau = challenger.sample_f256_vec(n);
+    let alpha = challenger.sample_f256();
     let tau_q = &tau[..pos_log];
     let tau_p = &tau[pos_log..n];
 
@@ -502,22 +505,22 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     //     + α · Σ_{i_p} eq(τ_p, i_p) · leaf_{i_p}(r)
     // (The root term has no τ_p dependence because the per-path boundary
     //  contributions sum out via Σ_{i_p} eq(τ_p, i_p) = 1.)
-    let eq_tau_q_ones = tau_q.iter().copied().fold(F128::ONE, |acc, t| acc * t);
+    let eq_tau_q_ones = tau_q.iter().copied().fold(F256::ONE, |acc, t| acc * t);
     let eq_tau_p_table = build_eq_table(tau_p);
-    let combined_leaf: F128 = eq_tau_p_table
+    let combined_leaf: F256 = eq_tau_p_table
         .iter()
         .zip(leaf_evals.iter())
         .map(|(&w, &v)| w * v)
-        .fold(F128::ZERO, |a, b| a + b);
+        .fold(F256::ZERO, |a, b| a + b);
     let mut claim = eq_tau_q_ones * root_r + alpha * combined_leaf;
 
     // Replay sumcheck rounds.
-    let mut r_pts: Vec<F128> = Vec::with_capacity(d);
+    let mut r_pts: Vec<F256> = Vec::with_capacity(d);
     for msg in &proof.rounds {
-        challenger.observe_f128(msg.q_1);
-        challenger.observe_f128(msg.q_omega);
-        challenger.observe_f128(msg.q_omega_plus_1);
-        let r = challenger.sample_f128();
+        challenger.observe_f256(msg.q_1);
+        challenger.observe_f256(msg.q_omega);
+        challenger.observe_f256(msg.q_omega_plus_1);
+        let r = challenger.sample_f256();
         // q(0) = claim + q(1) (char 2 == subtraction).
         let q_0 = claim + msg.q_1;
         // Evaluate q(r) via Lagrange over {0, 1, ω, ω+1}.
@@ -526,7 +529,7 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     }
 
     // Reconstruct the random point — same convention as the prover.
-    let mut instance_point = vec![F128::ZERO; n];
+    let mut instance_point = vec![F256::ZERO; n];
     for j in 0..n {
         instance_point[j] = r_pts[n - 1 - j];
     }
@@ -553,7 +556,7 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     let eq_tauyq_zero = tau_y_q
         .iter()
         .copied()
-        .fold(F128::ONE, |acc, t| acc * (F128::ONE + t));
+        .fold(F256::ONE, |acc, t| acc * (F256::ONE + t));
     let t_shift_alpha = eq_taup_tauyp * (shift_q + alpha * eq_tauyq_zero);
     let t_eq = eq_eval(&tau, &instance_point);
     // B(τ_y) — naive O(N). Apply the per-path B-convention (first row of every
@@ -563,7 +566,7 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
         b_local[i_p << pos_log] = false;
     }
     let t_b = eval_bit_mle(&b_local, &instance_point);
-    let one_plus_t_b = F128::ONE + t_b;
+    let one_plus_t_b = F256::ONE + t_b;
 
     let w_z_contrib = slot_indicator(layout.z_slot, sel_slot, side) * t_eq;
     let w_xl_contrib =
@@ -604,11 +607,17 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             z ^ (z >> 31)
         }
-        fn f128(&mut self) -> F128 {
-            F128 {
-                lo: self.next_u64(),
-                hi: self.next_u64(),
-            }
+        fn f256(&mut self) -> F256 {
+            F256::new(
+                F128 {
+                    lo: self.next_u64(),
+                    hi: self.next_u64(),
+                },
+                F128 {
+                    lo: self.next_u64(),
+                    hi: self.next_u64(),
+                },
+            )
         }
         fn bit(&mut self) -> bool {
             self.next_u64() & 1 == 1
@@ -624,41 +633,41 @@ mod tests {
         n: usize,
         seed: u64,
     ) -> (
-        Vec<F128>, // x_l
-        Vec<F128>, // x_r
-        Vec<F128>, // z
-        Vec<F128>, // iv (arbitrary)
+        Vec<F256>, // x_l
+        Vec<F256>, // x_r
+        Vec<F256>, // z
+        Vec<F256>, // iv (arbitrary)
         Vec<bool>, // b
-        F128,      // leaf = Sel(0) = X_L(0)
-        F128,      // root = Z(K-1)
+        F256,      // leaf = Sel(0) = X_L(0)
+        F256,      // root = Z(K-1)
     ) {
         let mut rng = Rng::new(seed);
         let k = 1usize << n;
         // Random per-hash outputs (we're testing the sumcheck math; R1CS would
         // enforce z_i = h(x_i, y_i) but here we just need the scalars).
-        let z_vals: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
+        let z_vals: Vec<F256> = (0..k).map(|_| rng.f256()).collect();
         // Bit vector: b_0 is unused (B(0) := 0); b_1..b_{K-1} are random.
         let mut b_bits = vec![false; k];
         for i in 1..k {
             b_bits[i] = rng.bit();
         }
-        let mut x_l = vec![F128::ZERO; k];
-        let mut x_r = vec![F128::ZERO; k];
+        let mut x_l = vec![F256::ZERO; k];
+        let mut x_r = vec![F256::ZERO; k];
         // Hash 0: Sel(0) = leaf. With B(0) = 0, Sel(0) = X_L(0). So X_L(0) = leaf.
-        let leaf = rng.f128();
+        let leaf = rng.f256();
         x_l[0] = leaf;
-        x_r[0] = rng.f128(); // sibling — arbitrary
+        x_r[0] = rng.f256(); // sibling — arbitrary
         // Hashes 1..K-1: Sel(i) = Z(i-1).
         for i in 1..k {
             if !b_bits[i] {
                 x_l[i] = z_vals[i - 1]; // selected
-                x_r[i] = rng.f128(); // sibling
+                x_r[i] = rng.f256(); // sibling
             } else {
                 x_r[i] = z_vals[i - 1]; // selected
-                x_l[i] = rng.f128(); // sibling
+                x_l[i] = rng.f256(); // sibling
             }
         }
-        let iv: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
+        let iv: Vec<F256> = (0..k).map(|_| rng.f256()).collect();
         let root = z_vals[k - 1];
         (x_l, x_r, z_vals, iv, b_bits, leaf, root)
     }
@@ -697,7 +706,7 @@ mod tests {
         // Corrupt a linked X_L (b=0 case).
         for i in 1..(1 << n) {
             if !b[i] {
-                x_l[i] += F128::ONE;
+                x_l[i] += F256::ONE;
                 break;
             }
         }
@@ -718,7 +727,7 @@ mod tests {
         let (proof, _) = prove_merkle_path_shift(0, &x_l, &x_r, &z, &iv, &b, layout, &mut ch_p);
         // Verify with a tampered leaf.
         let mut bad_leaf = leaf;
-        bad_leaf.lo ^= 1;
+        bad_leaf.c0.lo ^= 1;
         let mut ch_v = FsChallenger::new(b"merkle-test-v0");
         let res = verify_merkle_path_shift(0, &proof, &[bad_leaf], root, &b, n, layout, &mut ch_v);
         assert!(matches!(res, Err(MerklePathError::SumcheckFinal)));
@@ -732,7 +741,7 @@ mod tests {
         let mut ch_p = FsChallenger::new(b"merkle-test-v0");
         let (proof, _) = prove_merkle_path_shift(0, &x_l, &x_r, &z, &iv, &b, layout, &mut ch_p);
         let mut bad_root = root;
-        bad_root.lo ^= 1;
+        bad_root.c0.lo ^= 1;
         let mut ch_v = FsChallenger::new(b"merkle-test-v0");
         let res = verify_merkle_path_shift(0, &proof, &[leaf], bad_root, &b, n, layout, &mut ch_v);
         assert!(matches!(res, Err(MerklePathError::SumcheckFinal)));

@@ -13,10 +13,10 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::gf2_128::software;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use flock_prover::field::gf2_128::aarch64;
-use flock_prover::field::{F8, F128, F256Unreduced};
+use flock_prover::field::gf2_128::software;
+use flock_prover::field::{F8, F128, F256, F256Unreduced};
 
 const N: usize = 100_000_000;
 
@@ -418,6 +418,103 @@ fn bench_f128_deferred() {
     );
 }
 
+/// Reference: the naive F256 mul (4 fully-reduced F128 muls, including a full
+/// PMULL multiply for `m2·β`). What the optimized `F256::mul` replaced.
+#[inline]
+fn naive_f256_mul(a: F256, b: F256) -> F256 {
+    let beta = F128 { lo: 0, hi: 1 << 57 }; // x^121
+    let m0 = a.c0 * b.c0;
+    let m2 = a.c1 * b.c1;
+    let m1 = (a.c0 + a.c1) * (b.c0 + b.c1);
+    F256::new(m0 + m2 * beta, m0 + m1)
+}
+
+fn bench_f256() {
+    header("F256 mul — optimized (3-mul Karatsuba + PMULL-free shift-β) vs naive");
+    let b = F256::new(
+        F128 {
+            lo: 0xFEDCBA9876543210,
+            hi: 0xA5A5A5A5A5A5A5A5,
+        },
+        F128 {
+            lo: 0x0F1E2D3C4B5A6978,
+            hi: 0x1122334455667788,
+        },
+    );
+    let seeds = [
+        F256::new(
+            F128 {
+                lo: 0xDEADBEEFCAFEBABE,
+                hi: 0x0123456789ABCDEF,
+            },
+            F128 {
+                lo: 0x9988776655443322,
+                hi: 0xFFEEDDCCBBAA0099,
+            },
+        ),
+        F256::new(
+            F128 {
+                lo: 0x1111111111111111,
+                hi: 0x2222222222222222,
+            },
+            F128 {
+                lo: 0x3333333333333333,
+                hi: 0x4444444444444444,
+            },
+        ),
+        F256::new(
+            F128 {
+                lo: 0x5555555555555555,
+                hi: 0x6666666666666666,
+            },
+            F128 {
+                lo: 0x7777777777777777,
+                hi: 0x8888888888888888,
+            },
+        ),
+        F256::new(
+            F128 {
+                lo: 0x99999999AAAAAAAA,
+                hi: 0xBBBBBBBBCCCCCCCC,
+            },
+            F128 {
+                lo: 0xDDDDDDDDEEEEEEEE,
+                hi: 0xF0F0F0F0F0F0F0F0,
+            },
+        ),
+    ];
+    macro_rules! tput {
+        ($label:expr, $op:expr) => {{
+            let (mut a0, mut a1, mut a2, mut a3) = (seeds[0], seeds[1], seeds[2], seeds[3]);
+            let iters = N / 4;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                a0 = $op(a0, b);
+                a1 = $op(a1, b);
+                a2 = $op(a2, b);
+                a3 = $op(a3, b);
+            }
+            let t = t0.elapsed().as_nanos() as f64;
+            let cs = (a0 + a1 + a2 + a3).c0.lo;
+            report($label, t, iters * 4, cs);
+        }};
+    }
+    tput!("naive F256 mul (4 PMULL-muls, throughput)", naive_f256_mul);
+    tput!(
+        "F256::mul optimized (throughput) ← default",
+        |a: F256, b: F256| a * b
+    );
+    {
+        let mut a = seeds[0];
+        let t0 = Instant::now();
+        for _ in 0..N {
+            a = a * b;
+        }
+        let t = t0.elapsed().as_nanos() as f64;
+        report("F256::mul optimized (latency)", t, N, a.c0.lo);
+    }
+}
+
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
     // Quick build-config sanity print so the reader knows which path is hot.
@@ -438,5 +535,6 @@ fn main() {
     bench_f128_add();
     bench_f128_mul();
     bench_f128_mul_by_x();
+    bench_f256();
     bench_f128_deferred();
 }

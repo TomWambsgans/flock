@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::merkle;
 use flock_prover::ntt::AdditiveNttF128;
 use flock_prover::pcs::{LOG_PACKING, PcsParams, commit, pack_witness};
@@ -88,7 +88,7 @@ fn bench_commit_breakdown(m: usize) {
     let bytes_code = (n_code as u64) * 16;
 
     println!(
-        "  m={m}: witness {} bits, packed {} × F128 ({}), code {} × F128 ({})",
+        "  m={m}: witness {} bits, packed {} × F256 ({}), code {} × F256 ({})",
         n_bits,
         n_packed,
         fmt_bytes((n_packed as u64) * 16),
@@ -106,14 +106,14 @@ fn bench_commit_breakdown(m: usize) {
 
     // ---- 2. Allocate + copy + zero-pad. (Commit-internal from here onward.)
     let t0 = Instant::now();
-    let mut codeword = vec![F128::ZERO; n_code];
+    let mut codeword = vec![F256::ZERO; n_code];
     codeword[..packed_witness.len()].copy_from_slice(&packed_witness);
     let secs_alloc = t0.elapsed().as_secs_f64();
 
     // ---- 3. Interleaved NTT.
     let ntt = AdditiveNttF128::standard(params.k_code());
     let t0 = Instant::now();
-    ntt.forward_transform_interleaved(&mut codeword, params.num_ntts());
+    ntt.forward_transform_interleaved_f256(&mut codeword, params.num_ntts());
     let secs_ntt = t0.elapsed().as_secs_f64();
 
     // ---- 4. Serialize codeword to bytes.
@@ -121,9 +121,11 @@ fn bench_commit_breakdown(m: usize) {
     let codeword_bytes: Vec<u8> = codeword
         .iter()
         .flat_map(|f| {
-            let mut b = [0u8; 16];
-            b[0..8].copy_from_slice(&f.lo.to_le_bytes());
-            b[8..16].copy_from_slice(&f.hi.to_le_bytes());
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&f.c0.lo.to_le_bytes());
+            b[8..16].copy_from_slice(&f.c0.hi.to_le_bytes());
+            b[16..24].copy_from_slice(&f.c1.lo.to_le_bytes());
+            b[24..32].copy_from_slice(&f.c1.hi.to_le_bytes());
             b
         })
         .collect();
@@ -186,13 +188,13 @@ fn main() {
     }
 
     header("PCS commit at the production target");
-    // m=29 = 2^29 bits = 64 MB witness. Packed = 4M F128 = 64 MB. Code = 8M F128 = 128 MB.
+    // m=29 = 2^29 bits = 64 MB witness. Packed = 4M F256 = 64 MB. Code = 8M F256 = 128 MB.
     bench_commit_breakdown(29);
 
     header("PCS commit at BLAKE3 m=30 / matched-codeword m=31");
-    // m=30: codeword = 2^24 F128 = 256 MB (Flock blake3_proof n=65536 size).
+    // m=30: codeword = 2^24 F256 = 256 MB (Flock blake3_proof n=65536 size).
     bench_commit_breakdown(30);
-    // m=31: codeword = 2^25 F128 = 512 MB (matches binius64 blake3 m=30 commit size).
+    // m=31: codeword = 2^25 F256 = 512 MB (matches binius64 blake3 m=30 commit size).
     // Witness 256 MB packed; bool-vec would be 2 GB so use packed-only path.
     bench_commit_packed_breakdown(31);
 
@@ -222,21 +224,27 @@ fn bench_commit_packed_only(m: usize) {
     let bytes_code = (n_code as u64) * 16;
 
     println!(
-        "  m={m}: packed {} × F128 ({}), code {} × F128 ({})",
+        "  m={m}: packed {} × F256 ({}), code {} × F256 ({})",
         n_packed,
         fmt_bytes(bytes_packed),
         n_code,
         fmt_bytes(bytes_code),
     );
 
-    // Build packed witness with deterministic random F128 contents.
+    // Build packed witness with deterministic random F256 contents.
     let t0 = Instant::now();
     let mut rng = Rng::new(0xC0FFEE ^ (m as u64));
-    let mut packed_witness: Vec<F128> = Vec::with_capacity(n_packed);
+    let mut packed_witness: Vec<F256> = Vec::with_capacity(n_packed);
     for _ in 0..n_packed {
-        packed_witness.push(F128 {
-            lo: rng.next_u64(),
-            hi: rng.next_u64(),
+        packed_witness.push(F256 {
+            c0: F128 {
+                lo: rng.next_u64(),
+                hi: rng.next_u64(),
+            },
+            c1: F128 {
+                lo: rng.next_u64(),
+                hi: rng.next_u64(),
+            },
         });
     }
     let secs_build = t0.elapsed().as_secs_f64();
@@ -275,7 +283,7 @@ fn bench_commit_packed_breakdown(m: usize) {
     let bytes_code = (n_code as u64) * 16;
 
     println!(
-        "  m={m}: packed {} × F128 ({}), code {} × F128 ({})",
+        "  m={m}: packed {} × F256 ({}), code {} × F256 ({})",
         n_packed,
         fmt_bytes(bytes_packed),
         n_code,
@@ -284,31 +292,37 @@ fn bench_commit_packed_breakdown(m: usize) {
 
     // Build packed witness directly.
     let mut rng = Rng::new(0xC0FFEE ^ (m as u64));
-    let mut packed_witness: Vec<F128> = Vec::with_capacity(n_packed);
+    let mut packed_witness: Vec<F256> = Vec::with_capacity(n_packed);
     for _ in 0..n_packed {
-        packed_witness.push(F128 {
-            lo: rng.next_u64(),
-            hi: rng.next_u64(),
+        packed_witness.push(F256 {
+            c0: F128 {
+                lo: rng.next_u64(),
+                hi: rng.next_u64(),
+            },
+            c1: F128 {
+                lo: rng.next_u64(),
+                hi: rng.next_u64(),
+            },
         });
     }
 
     // ---- 1. Allocate codeword + copy witness + zero-pad upper half.
     let t0 = Instant::now();
-    let mut codeword = vec![F128::ZERO; n_code];
+    let mut codeword = vec![F256::ZERO; n_code];
     codeword[..packed_witness.len()].copy_from_slice(&packed_witness);
     let secs_alloc = t0.elapsed().as_secs_f64();
 
     // ---- 2. Interleaved NTT.
     let ntt = AdditiveNttF128::standard(params.k_code());
     let t0 = Instant::now();
-    ntt.forward_transform_interleaved(&mut codeword, params.num_ntts());
+    ntt.forward_transform_interleaved_f256(&mut codeword, params.num_ntts());
     let secs_ntt = t0.elapsed().as_secs_f64();
 
     // ---- 3. Cast codeword bytes (zero-copy — same as pcs::commit).
     let codeword_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
+            codeword.len() * core::mem::size_of::<F256>(),
         )
     };
 

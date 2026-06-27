@@ -16,7 +16,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::zerocheck::multilinear::{
     fold_and_compute_round_pair_optimized, fold_in_place_pair, round_pair_naive,
 };
@@ -35,13 +35,19 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
-    fn f128_vec(&mut self, n: usize) -> Vec<F128> {
+    fn f128_vec(&mut self, n: usize) -> Vec<F256> {
         (0..n).map(|_| self.f128()).collect()
     }
 }
@@ -52,10 +58,10 @@ impl Rng {
 ///   - else, unfused fold_in_place + round_pair_naive
 ///   - final fold at the last challenge
 fn run_chain(
-    mut a: Vec<F128>,
-    mut b: Vec<F128>,
-    mlv_challenges: &[F128],
-) -> (Vec<F128>, Vec<F128>) {
+    mut a: Vec<F256>,
+    mut b: Vec<F256>,
+    mlv_challenges: &[F256],
+) -> (Vec<F256>, Vec<F256>) {
     let n_rounds = mlv_challenges.len();
     // Each iteration consumes one challenge and produces a message + folded state.
     for i in 0..(n_rounds.saturating_sub(1)) {
@@ -92,13 +98,13 @@ fn main() {
         let n_after_round2 = 1usize << (n_rest - 1);
         let n_rounds_remaining = n_rest - 1;
         println!(
-            "\n=== m = {m}: round-3 entry state {} F128 entries, {} rounds remaining ===",
+            "\n=== m = {m}: round-3 entry state {} F256 entries, {} rounds remaining ===",
             n_after_round2, n_rounds_remaining
         );
 
         let mut rng = Rng::new(0xD3CADE42 + m as u64);
-        let a: Vec<F128> = (0..n_after_round2).map(|_| rng.f128()).collect();
-        let b: Vec<F128> = (0..n_after_round2).map(|_| rng.f128()).collect();
+        let a: Vec<F256> = (0..n_after_round2).map(|_| rng.f128()).collect();
+        let b: Vec<F256> = (0..n_after_round2).map(|_| rng.f128()).collect();
         let mlv_challenges = rng.f128_vec(n_rounds_remaining);
 
         // Warm up.
@@ -119,7 +125,7 @@ fn main() {
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
             println!("  {:<48} {:>10.2} ms", label, elapsed);
             best_ms = best_ms.min(elapsed);
-            cs ^= a_final[0].lo ^ b_final[0].lo;
+            cs ^= a_final[0].c0.lo ^ b_final[0].c0.lo;
         }
         if n_runs > 1 {
             println!("  {:<48} {:>10.2} ms", "  (best)", best_ms);

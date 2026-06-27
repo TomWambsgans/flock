@@ -7,7 +7,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::pcs::ring_switch::fold_b128_elems_split;
 
 struct Rng(u64);
@@ -22,10 +22,16 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
@@ -57,18 +63,18 @@ fn main() {
     let mut rng = Rng::new(0xC0FFEE);
 
     // Build (eq_lo, eq_hi) for 2 claims.
-    let eq_lo_0: Vec<F128> = (0..b_lo).map(|_| rng.f128()).collect();
-    let eq_hi_0: Vec<F128> = (0..b_hi).map(|_| rng.f128()).collect();
-    let eq_lo_1: Vec<F128> = (0..b_lo).map(|_| rng.f128()).collect();
-    let eq_hi_1: Vec<F128> = (0..b_hi).map(|_| rng.f128()).collect();
+    let eq_lo_0: Vec<F256> = (0..b_lo).map(|_| rng.f128()).collect();
+    let eq_hi_0: Vec<F256> = (0..b_hi).map(|_| rng.f128()).collect();
+    let eq_lo_1: Vec<F256> = (0..b_lo).map(|_| rng.f128()).collect();
+    let eq_hi_1: Vec<F256> = (0..b_hi).map(|_| rng.f128()).collect();
 
     // Build eq_r_dprime (length 128) for 2 claims via the standard
     // tensor-product expansion of 7-coord r''.
-    fn build_eq(r: &[F128]) -> Vec<F128> {
-        let mut acc = vec![F128 { lo: 1, hi: 0 }];
+    fn build_eq(r: &[F256]) -> Vec<F256> {
+        let mut acc = vec![F256::ONE];
         for &ri in r {
             let mut next = Vec::with_capacity(acc.len() * 2);
-            let one = F128 { lo: 1, hi: 0 };
+            let one = F256::ONE;
             for &a in &acc {
                 next.push(a * (one + ri));
                 next.push(a * ri);
@@ -77,8 +83,8 @@ fn main() {
         }
         acc
     }
-    let r_dprime_0: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
-    let r_dprime_1: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
+    let r_dprime_0: Vec<F256> = (0..7).map(|_| rng.f128()).collect();
+    let r_dprime_1: Vec<F256> = (0..7).map(|_| rng.f128()).collect();
     let eq_r_dprime_0 = build_eq(&r_dprime_0);
     let eq_r_dprime_1 = build_eq(&r_dprime_1);
 
@@ -115,7 +121,7 @@ fn main() {
 
         let tc = Instant::now();
         use rayon::prelude::*;
-        let b_combined: Vec<F128> = (0..l)
+        let b_combined: Vec<F256> = (0..l)
             .into_par_iter()
             .map(|j| g0 * b0[j] + g1 * b1[j])
             .collect();
@@ -160,7 +166,7 @@ fn main() {
         let t_all = Instant::now();
 
         let ts0 = Instant::now();
-        let scaled_0: Vec<F128> = eq_r_dprime_0.iter().map(|x| g0 * *x).collect();
+        let scaled_0: Vec<F256> = eq_r_dprime_0.iter().map(|x| g0 * *x).collect();
         let dts0 = ts0.elapsed().as_secs_f64();
         b_scale0_total += dts0;
 
@@ -170,7 +176,7 @@ fn main() {
         b_fold0_total += dt0;
 
         let ts1 = Instant::now();
-        let scaled_1: Vec<F128> = eq_r_dprime_1.iter().map(|x| g1 * *x).collect();
+        let scaled_1: Vec<F256> = eq_r_dprime_1.iter().map(|x| g1 * *x).collect();
         let dts1 = ts1.elapsed().as_secs_f64();
         b_scale1_total += dts1;
 
@@ -181,7 +187,7 @@ fn main() {
 
         let tc = Instant::now();
         use rayon::prelude::*;
-        let b_combined: Vec<F128> = (0..l).into_par_iter().map(|j| b0[j] + b1[j]).collect();
+        let b_combined: Vec<F256> = (0..l).into_par_iter().map(|j| b0[j] + b1[j]).collect();
         let dtc = tc.elapsed().as_secs_f64();
         b_combine_total += dtc;
 

@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
-use flock_prover::field::F128;
+use flock_prover::field::F256;
 use flock_prover::pcs::Commitment;
 use flock_prover::proof_io::{
     AnyChainBundle, BundleReadError, ChainProofBundle, ChainProofBundleLigerito, HashKind,
@@ -661,7 +661,7 @@ fn main() -> ExitCode {
     };
 
     // Silence unused-import lint for the type-only re-export.
-    let _ = F128::ZERO;
+    let _ = F256::ZERO;
 
     match result {
         Ok(()) => ExitCode::SUCCESS,

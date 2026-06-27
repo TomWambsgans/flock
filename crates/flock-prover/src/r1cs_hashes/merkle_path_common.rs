@@ -19,10 +19,10 @@
 //! coords, so its contents are invisible to the sumcheck but participate in
 //! the multilinear extension over the slot-selector dimensions.
 
-use flock_core::challenger::Challenger;
-use flock_core::field::F128;
-use flock_core::lincheck::build_eq_table;
 use crate::merkle_path::{MerklePathShiftProof, SlotLayout};
+use flock_core::challenger::Challenger;
+use flock_core::field::F256;
+use flock_core::lincheck::build_eq_table;
 use flock_core::pcs::{
     Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef, PcsParams,
 };
@@ -102,15 +102,15 @@ impl MerkleLayout {
 
 /// Packed-level fold parameters: `τ_pos` binds the packed-position dimension
 /// within each slot. The verifier samples `τ_pos`, then the prover folds each
-/// instance's 4 slots down to one `F128` apiece via
+/// instance's 4 slots down to one `F256` apiece via
 /// `Σ_{pos} eq(τ_pos, pos) · ẑ_packed[(inst, slot, pos)]`.
 #[derive(Clone, Debug)]
 pub struct MerklePathFold {
-    pub tau_pos: Vec<F128>,
+    pub tau_pos: Vec<F256>,
 }
 
 impl MerklePathFold {
-    pub fn new(layout: &MerkleLayout, tau_pos: Vec<F128>) -> Self {
+    pub fn new(layout: &MerkleLayout, tau_pos: Vec<F256>) -> Self {
         assert_eq!(
             tau_pos.len(),
             layout.tau_pos_len(),
@@ -120,11 +120,11 @@ impl MerklePathFold {
     }
 
     /// Fold a public k-bit endpoint (given as `region_bits` bools in physical
-    /// within-slot order) to a single F128 — the τ_pos-MLE of the endpoint
+    /// within-slot order) to a single F256 — the τ_pos-MLE of the endpoint
     /// over its slot's packed positions. Mirrors what the prover computes
     /// against the committed witness.
-    pub fn fold_public_phys(&self, phys_bits: &[bool]) -> F128 {
-        let bits_per_packed = 1usize << LOG_PACKING; // 128
+    pub fn fold_public_phys(&self, phys_bits: &[bool]) -> F256 {
+        let bits_per_packed = 1usize << LOG_PACKING; // 256
         let n_packed = 1usize << self.tau_pos.len();
         let slot_bits = n_packed * bits_per_packed;
         assert!(
@@ -134,16 +134,22 @@ impl MerklePathFold {
             slot_bits,
         );
         let eq_tau = build_eq_table(&self.tau_pos);
-        let mut acc = F128::ZERO;
+        let mut acc = F256::ZERO;
         for pos in 0..n_packed {
-            let mut packed = F128::ZERO;
+            // The 256 bits of one packed element map to the four LE u64 words
+            // [c0.lo, c0.hi, c1.lo, c1.hi] — bit `b` lives in word `b / 64` at
+            // sub-bit `b % 64`, matching the committed witness's F256 layout.
+            let mut packed = F256::ZERO;
             for b in 0..bits_per_packed {
                 let bit_idx = pos * bits_per_packed + b;
                 if bit_idx < phys_bits.len() && phys_bits[bit_idx] {
-                    if b < 64 {
-                        packed.lo |= 1u64 << b;
-                    } else {
-                        packed.hi |= 1u64 << (b - 64);
+                    let word = b / 64;
+                    let sub = b % 64;
+                    match word {
+                        0 => packed.c0.lo |= 1u64 << sub,
+                        1 => packed.c0.hi |= 1u64 << sub,
+                        2 => packed.c1.lo |= 1u64 << sub,
+                        _ => packed.c1.hi |= 1u64 << sub,
                     }
                 }
             }
@@ -157,15 +163,15 @@ impl MerklePathFold {
 // Per-slot fold from packed witness
 // ---------------------------------------------------------------------------
 
-/// For each of the 4 slot positions, compute one F128 per instance: the
+/// For each of the 4 slot positions, compute one F256 per instance: the
 /// τ_pos-MLE of that slot's content. Output `result[s][i]` is the τ_pos-fold
 /// of slot `s` for instance `i`. Slot index uses LSB-first encoding
 /// `s = sel_slot | (side << 1)`, matching the cube convention.
 pub fn fold_all_slots(
     layout: &MerkleLayout,
-    packed: &[F128],
+    packed: &[F256],
     fold: &MerklePathFold,
-) -> [Vec<F128>; 4] {
+) -> [Vec<F256>; 4] {
     use rayon::prelude::*;
 
     let bits_per_packed = 1usize << LOG_PACKING;
@@ -181,8 +187,8 @@ pub fn fold_all_slots(
 
     let eq_tau = build_eq_table(&fold.tau_pos);
 
-    let fold_one = |base: usize| -> F128 {
-        let mut acc = F128::ZERO;
+    let fold_one = |base: usize| -> F256 {
+        let mut acc = F256::ZERO;
         for pos in 0..n_packed_per_slot {
             acc += eq_tau[pos] * packed[base + pos];
         }
@@ -190,7 +196,7 @@ pub fn fold_all_slots(
     };
 
     // Build each slot's vector in parallel.
-    let mut results: [Vec<F128>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut results: [Vec<F256>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for (slot_idx, vec_out) in results.iter_mut().enumerate() {
         let slot_offset = slot_base_packed + slot_idx * n_packed_per_slot;
         *vec_out = (0..n_inst)
@@ -227,7 +233,7 @@ pub fn assemble_merkle_path_claim(
     point.extend_from_slice(&fold.tau_pos);
     point.push(claims.sel_slot);
     point.push(claims.side);
-    point.extend(std::iter::repeat_n(F128::ZERO, high));
+    point.extend(std::iter::repeat_n(F256::ZERO, high));
     point.extend_from_slice(&claims.instance_point);
     debug_assert_eq!(point.len(), point_len);
 
@@ -245,14 +251,14 @@ fn build_merkle_claim_point(
     layout: &MerkleLayout,
     fold: &MerklePathFold,
     claims: &crate::merkle_path::MerklePathClaims,
-) -> Vec<F128> {
+) -> Vec<F256> {
     let high = layout.high_zeros();
     let point_len = fold.tau_pos.len() + 2 + high + claims.instance_point.len();
     let mut point = Vec::with_capacity(point_len);
     point.extend_from_slice(&fold.tau_pos);
     point.push(claims.sel_slot);
     point.push(claims.side);
-    point.extend(std::iter::repeat_n(F128::ZERO, high));
+    point.extend(std::iter::repeat_n(F256::ZERO, high));
     point.extend_from_slice(&claims.instance_point);
     debug_assert_eq!(point.len(), point_len);
     point
@@ -292,9 +298,9 @@ pub fn prove_merkle_path_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     layout: &MerkleLayout,
-    z_packed: Vec<F128>,
-    a_packed: Vec<F128>,
-    b_packed: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed: Vec<F256>,
+    b_packed: Vec<F256>,
     z_lincheck: Vec<u8>,
     b_bits: &[bool],
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
@@ -332,7 +338,7 @@ pub fn prove_merkle_path_generic<Ch: Challenger>(
     } else {
         None
     };
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = challenger.sample_f256_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
     let slot_vals = fold_all_slots(layout, &core.z_packed, &fold);
     if let Some(t) = t {
@@ -384,8 +390,8 @@ pub fn prove_merkle_path_generic<Ch: Challenger>(
     };
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
-    let pre_ab: Option<&[flock_core::field::F128]> = core.s_hat_v_ab.as_deref();
-    let pre_c: Option<&[flock_core::field::F128]> = Some(core.s_hat_v_c.as_slice());
+    let pre_ab: Option<&[flock_core::field::F256]> = None /* PERF TODO(f256): s_hat_v_ab z_vec path */;
+    let pre_c: Option<&[flock_core::field::F256]> = None /* PERF TODO(f256): s_hat_v_c 128-wide */;
     let pcs_open = flock_core::pcs::open_batch_mixed_with_precomputed_s_hat_v(
         &core.z_packed,
         &core.prover_data,
@@ -461,7 +467,7 @@ pub fn verify_merkle_path_generic<Ch: Challenger>(
 
     // ---- Packed-pos fold (matches prover transcript order).
     let t = std::time::Instant::now();
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = challenger.sample_f256_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
 
     let leaf_r = fold.fold_public_phys(leaf_phys);
@@ -534,9 +540,9 @@ pub fn prove_merkle_paths_generic<Ch: Challenger>(
     pcs_params: &PcsParams,
     layout: &MerkleLayout,
     path_log: usize,
-    z_packed: Vec<F128>,
-    a_packed: Vec<F128>,
-    b_packed: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed: Vec<F256>,
+    b_packed: Vec<F256>,
     z_lincheck: Vec<u8>,
     b_bits: &[bool],
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
@@ -572,7 +578,7 @@ pub fn prove_merkle_paths_generic<Ch: Challenger>(
     } else {
         None
     };
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = challenger.sample_f256_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
     let slot_vals = fold_all_slots(layout, &core.z_packed, &fold);
     if let Some(t) = t {
@@ -622,8 +628,8 @@ pub fn prove_merkle_paths_generic<Ch: Challenger>(
     };
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
-    let pre_ab: Option<&[flock_core::field::F128]> = core.s_hat_v_ab.as_deref();
-    let pre_c: Option<&[flock_core::field::F128]> = Some(core.s_hat_v_c.as_slice());
+    let pre_ab: Option<&[flock_core::field::F256]> = None /* PERF TODO(f256): s_hat_v_ab z_vec path */;
+    let pre_c: Option<&[flock_core::field::F256]> = None /* PERF TODO(f256): s_hat_v_c 128-wide */;
     let pcs_open = flock_core::pcs::open_batch_mixed_with_precomputed_s_hat_v(
         &core.z_packed,
         &core.prover_data,
@@ -705,11 +711,11 @@ pub fn verify_merkle_paths_generic<Ch: Challenger>(
     }
 
     let t = std::time::Instant::now();
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = challenger.sample_f256_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
 
     // Fold each per-path leaf at τ_pos; root only once (it's shared).
-    let leaf_evals: Vec<F128> = leaves_phys
+    let leaf_evals: Vec<F256> = leaves_phys
         .iter()
         .map(|lp| fold.fold_public_phys(lp))
         .collect();

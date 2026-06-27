@@ -4,7 +4,7 @@
 //! witness commitment.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::F256;
 use crate::lincheck::{self, QuirkyPoint};
 use crate::pcs::{self, Commitment};
 use crate::proof::{R1csClaim, R1csProof, R1csProofLigerito, ZClaim};
@@ -40,8 +40,9 @@ fn verifier_pool() -> &'static rayon::ThreadPool {
             // The whole verify body runs on this worker — including the deep
             // recursive Ligerito verifier — so give it an ample stack. A rayon
             // worker otherwise defaults to ~2 MiB (vs the 8 MiB main thread),
-            // which the recursion overflows.
-            .stack_size(64 * 1024 * 1024)
+            // which the recursion overflows. Bumped to 256 MiB for F256: the
+            // 32-byte field elements ~double the recursion's frame size.
+            .stack_size(256 * 1024 * 1024)
             .thread_name(|_| "flock-verify".to_string())
             .build()
             .expect("build single-thread verifier pool")
@@ -127,9 +128,9 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<(), pcs::VerifyError> {
-    let z_skips: Vec<F128> = claims.iter().map(|c| c.point.z_skip).collect();
-    let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
-    let x_fulls: Vec<Vec<F128>> = claims
+    let z_skips: Vec<F256> = claims.iter().map(|c| c.point.z_skip).collect();
+    let values: Vec<F256> = claims.iter().map(|c| c.value).collect();
+    let x_fulls: Vec<Vec<F256>> = claims
         .iter()
         .map(|c| {
             let mut v = c.point.x_inner_rest.clone();
@@ -137,7 +138,7 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
             v
         })
         .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let x_refs: Vec<&[F256]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let log_n = pcs_params.m - pcs::LOG_PACKING;
     let lig_v_config = crate::pcs::ligerito::verifier_config_for(
         log_n,
@@ -292,9 +293,9 @@ fn verify_claims_inner<Ch: Challenger>(
     pcs_open: &pcs::BatchOpeningProof,
     challenger: &mut Ch,
 ) -> Result<(), pcs::VerifyError> {
-    let z_skips: Vec<F128> = claims.iter().map(|c| c.point.z_skip).collect();
-    let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
-    let x_fulls: Vec<Vec<F128>> = claims
+    let z_skips: Vec<F256> = claims.iter().map(|c| c.point.z_skip).collect();
+    let values: Vec<F256> = claims.iter().map(|c| c.value).collect();
+    let x_fulls: Vec<Vec<F256>> = claims
         .iter()
         .map(|c| {
             let mut v = c.point.x_inner_rest.clone();
@@ -302,7 +303,7 @@ fn verify_claims_inner<Ch: Challenger>(
             v
         })
         .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let x_refs: Vec<&[F256]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     pcs::verify_opening_batch(commitment, &values, &z_skips, &x_refs, pcs_open, challenger)
 }
 

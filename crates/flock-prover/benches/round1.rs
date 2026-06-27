@@ -10,7 +10,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::{F8, F128};
+use flock_prover::field::{F8, F128, F256};
 use flock_prover::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use flock_prover::zerocheck::univariate_skip::{pack_bits, round1_extract_c_packed, round1_naive};
 use flock_prover::zerocheck::univariate_skip_optimized::{
@@ -45,25 +45,31 @@ impl Rng {
             buf[i..].copy_from_slice(&v[..len - i]);
         }
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
-        }
+    fn f256(&mut self) -> F256 {
+        F256::new(
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+        )
     }
-    fn f128_vec(&mut self, n: usize) -> Vec<F128> {
-        (0..n).map(|_| self.f128()).collect()
+    fn f256_vec(&mut self, n: usize) -> Vec<F256> {
+        (0..n).map(|_| self.f256()).collect()
     }
 }
 
-fn build_protocol_r(m: usize, outer: &[F128]) -> Vec<F128> {
+fn build_protocol_r(m: usize, outer: &[F256]) -> Vec<F256> {
     assert_eq!(outer.len(), m - K_SKIP - N_INNER);
-    let mut r = vec![F128::ZERO; m];
+    let mut r = vec![F256::ZERO; m];
     for (i, &small) in small_challenges_ghash().iter().enumerate() {
-        r[K_SKIP + i] = small;
+        r[K_SKIP + i] = F256::from_f128(small);
     }
     for (i, &med) in medium_challenges_ghash().iter().enumerate() {
-        r[K_SKIP + 3 + i] = med;
+        r[K_SKIP + 3 + i] = F256::from_f128(med);
     }
     for (i, &x) in outer.iter().enumerate() {
         r[K_SKIP + N_INNER + i] = x;
@@ -136,7 +142,7 @@ fn main() {
             None
         };
 
-        let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+        let outer = rng.f256_vec(m - K_SKIP - N_INNER);
         let r = build_protocol_r(m, &outer);
 
         // Naive (small m only).
@@ -152,7 +158,7 @@ fn main() {
                     &r,
                 )
             });
-            naive_checksum = n_ab[0].lo ^ n_c[0].lo;
+            naive_checksum = n_ab[0].c0.lo ^ n_c[0].c0.lo;
         }
 
         // Pack-bits cost on its own — same as round trip from bool, since
@@ -204,7 +210,7 @@ fn main() {
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
             println!("  {:<40} {:>10.2} ms", label, elapsed);
             best_opt_ms = best_opt_ms.min(elapsed);
-            o_cs = o_ab[0].lo ^ o_c[0].lo;
+            o_cs = o_ab[0].c0.lo ^ o_c[0].c0.lo;
         }
         if n_runs > 1 {
             println!("  {:<40} {:>10.2} ms", "  (best)", best_opt_ms);
@@ -248,7 +254,7 @@ fn main() {
             println!("  {:<40} {:>10.2} ms", "  (best)", best_fusion_ms);
         }
 
-        let s_cs = s_ab[0].lo ^ s_c[0].lo;
+        let s_cs = s_ab[0].c0.lo ^ s_c[0].c0.lo;
         if naive_checksum != 0 {
             println!(
                 "  checksums:  naive={naive_checksum:016x}  structural={s_cs:016x}  optimized={o_cs:016x}"

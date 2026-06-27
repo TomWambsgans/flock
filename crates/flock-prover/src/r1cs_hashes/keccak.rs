@@ -17,7 +17,7 @@
 //!    a fully-materialized baseline, but we never materialize them — the
 //!    [`KeccakLincheckCircuit`] walker computes the lincheck column marginal
 //!    by a backward transpose recurrence
-//!    `K_r = φᵀ(K_{r+1}) ⊕ χ_r` density-independent in ~1M F128 ops.
+//!    `K_r = φᵀ(K_{r+1}) ⊕ χ_r` density-independent in ~1M F256 ops.
 //!
 //! `state_24` is kept at an I/O-aligned slot (2048-bit window starting at
 //! bit 2048) so the generic chain shift sumcheck can compare consecutive
@@ -62,13 +62,13 @@
 //! the slow `prove` path will report "everything satisfied vacuously" for
 //! this encoding — only use `prove_fast`/`prove_chain`.
 
+use crate::r1cs_hashes::chain_common::{ChainLayout, ChainProof, ChainVerifyError};
 use flock_core::challenger::Challenger;
-use flock_core::field::F128;
+use flock_core::field::F256;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProof};
 use flock_core::r1cs::BlockR1cs;
-use crate::r1cs_hashes::chain_common::{ChainLayout, ChainProof, ChainVerifyError};
 use flock_core::verifier;
 
 // ===========================================================================
@@ -517,11 +517,11 @@ pub fn min_n_keccaks_log(n_keccaks: usize) -> usize {
     bits.max(3)
 }
 
-/// Apply φᵀ to a length-`STATE_BITS` F128 buffer: `out[s_in] = Σ_{s_out :
+/// Apply φᵀ to a length-`STATE_BITS` F256 buffer: `out[s_in] = Σ_{s_out :
 /// s_in ∈ preim(s_out)} in[s_out]`.
-pub(crate) fn apply_phi_t(v: &[F128]) -> Vec<F128> {
+pub(crate) fn apply_phi_t(v: &[F256]) -> Vec<F256> {
     debug_assert_eq!(v.len(), STATE_BITS);
-    let mut out = vec![F128::ZERO; STATE_BITS];
+    let mut out = vec![F256::ZERO; STATE_BITS];
     for s_out in 0..STATE_BITS {
         let z_p = s_out / N_LANES;
         let xy = s_out % N_LANES;
@@ -646,7 +646,7 @@ fn build_chain_witness_ab_packed_into(
 pub fn generate_witness_with_ab_packed_and_lincheck(
     initial_states: &[State],
     n_keccaks_log: usize,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+) -> (Vec<F256>, Vec<F256>, Vec<F256>, Vec<u8>) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid keccak_f(0) computation so the constant cell is 1 in every block.
     // (The chain forbids padding — `prove_chain` asserts no padding — so this is
@@ -692,9 +692,9 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         Some(Z_CONST)
     }
 
-    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+    fn fold_alpha_batched(&self, alpha: F256, eq_inner: &[F256]) -> Vec<F256> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut comb = vec![F128::ZERO; K];
+        let mut comb = vec![F256::ZERO; K];
 
         // ---- Row 0 (const): A = [Z_CONST], B = [Z_CONST].
         let e0 = eq_inner[Z_CONST];
@@ -710,8 +710,8 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         }
 
         // ---- state_24 pin rows: A = L_24[j], B = [Z_CONST].
-        let mut vec_pin: Vec<F128> = vec![F128::ZERO; STATE_BITS];
-        let mut sum_eq_pin = F128::ZERO;
+        let mut vec_pin: Vec<F256> = vec![F256::ZERO; STATE_BITS];
+        let mut sum_eq_pin = F256::ZERO;
         for j in 0..STATE_BITS {
             let row = z_pos_state(24, j);
             let e = eq_inner[row];
@@ -721,9 +721,9 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         comb[Z_CONST] += sum_eq_pin; // B-side from pin's B = [Z_CONST]
 
         // ---- t-AND rows: build per-round χ marginals on state_r positions.
-        let mut chi_a: Vec<Vec<F128>> = (0..N_T).map(|_| vec![F128::ZERO; STATE_BITS]).collect();
-        let mut chi_b: Vec<Vec<F128>> = (0..N_T).map(|_| vec![F128::ZERO; STATE_BITS]).collect();
-        let mut sum_eq_t = F128::ZERO;
+        let mut chi_a: Vec<Vec<F256>> = (0..N_T).map(|_| vec![F256::ZERO; STATE_BITS]).collect();
+        let mut chi_b: Vec<Vec<F256>> = (0..N_T).map(|_| vec![F256::ZERO; STATE_BITS]).collect();
+        let mut sum_eq_t = F256::ZERO;
 
         for r in 0..N_T {
             for zpos in 0..64 {
@@ -746,8 +746,8 @@ impl LincheckCircuit for KeccakLincheckCircuit {
 
         // ---- Round-constant accumulation. After loop rc = RC_24.
         let mut rc = [false; STATE_BITS];
-        let mut rc_a = F128::ZERO;
-        let mut rc_b = F128::ZERO;
+        let mut rc_a = F256::ZERO;
+        let mut rc_b = F256::ZERO;
         for r in 0..N_T {
             for s in 0..STATE_BITS {
                 if rc[s] {
@@ -763,7 +763,7 @@ impl LincheckCircuit for KeccakLincheckCircuit {
                 }
             }
         }
-        let mut rc_pin = F128::ZERO;
+        let mut rc_pin = F256::ZERO;
         for s in 0..STATE_BITS {
             if rc[s] {
                 rc_pin += vec_pin[s];
@@ -883,7 +883,10 @@ impl KeccakSetup {
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(n_keccaks: usize, profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
+    pub fn with_profile(
+        n_keccaks: usize,
+        profile: flock_core::pcs::ligerito::LigeritoProfile,
+    ) -> Self {
         Self::with_profile_and_rate(n_keccaks, profile, profile.log_inv_rate())
     }
 
@@ -1132,6 +1135,7 @@ impl KeccakSetup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flock_core::field::F128;
 
     /// SplitMix64 PRNG.
     struct Rng(u64);
@@ -1362,19 +1366,23 @@ mod tests {
         let mut b_u64 = vec![0u64; U64_PER_BLOCK];
         build_chain_witness_ab_packed_into(&initial, &mut z_u64, &mut a_u64, &mut b_u64);
 
-        let alpha = F128 {
-            lo: rng.next_u64(),
-            hi: rng.next_u64(),
+        let mut rand_f256 = || {
+            F256::new(
+                F128 {
+                    lo: rng.next_u64(),
+                    hi: rng.next_u64(),
+                },
+                F128 {
+                    lo: rng.next_u64(),
+                    hi: rng.next_u64(),
+                },
+            )
         };
-        let eq_inner: Vec<F128> = (0..K)
-            .map(|_| F128 {
-                lo: rng.next_u64(),
-                hi: rng.next_u64(),
-            })
-            .collect();
+        let alpha = rand_f256();
+        let eq_inner: Vec<F256> = (0..K).map(|_| rand_f256()).collect();
 
-        let mut v_a = F128::ZERO;
-        let mut v_b = F128::ZERO;
+        let mut v_a = F256::ZERO;
+        let mut v_b = F256::ZERO;
         for i in 0..K {
             let u = i / 64;
             let bit = i % 64;
@@ -1390,7 +1398,7 @@ mod tests {
         let walker = KeccakLincheckCircuit;
         let comb = walker.fold_alpha_batched(alpha, &eq_inner);
 
-        let mut got = F128::ZERO;
+        let mut got = F256::ZERO;
         for c in 0..K {
             let u = c / 64;
             let bit = c % 64;
@@ -1477,9 +1485,9 @@ mod tests {
         let zeros: Vec<State> = vec![[false; STATE_BITS]; n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_keccaks_log());
-        z.iter_mut().for_each(|v| *v = F128::ZERO);
-        a.iter_mut().for_each(|v| *v = F128::ZERO);
-        b.iter_mut().for_each(|v| *v = F128::ZERO);
+        z.iter_mut().for_each(|v| *v = F256::ZERO);
+        a.iter_mut().for_each(|v| *v = F256::ZERO);
+        b.iter_mut().for_each(|v| *v = F256::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let mut ch_p = FsChallenger::new(b"poc");
         let (proof, commitment, _) = crate::prover::prove_fast_from_witness(

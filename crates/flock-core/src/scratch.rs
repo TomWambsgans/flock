@@ -17,10 +17,11 @@
 //! the m = 29 prove set). Call [`clear`] to release everything to the OS,
 //! e.g. after the last prove of a batch.
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 use std::sync::Mutex;
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+static POOL_256: Mutex<Vec<Vec<F256>>> = Mutex::new(Vec::new());
 
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
@@ -133,9 +134,67 @@ pub fn prewarm_prover(m: usize) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// F256 pool — mirror of the F128 pool for the extension-field transients (the
+// codeword, fold outputs, ring-switch / basefold working buffers, which all
+// carry F256 once the protocol layer is on the 256-bit field). Kept as a
+// separate pool because F256 is 2× wide, so its buffers must not satisfy F128
+// `take` requests (different element type) and vice versa.
+// ---------------------------------------------------------------------------
+
+/// Take a length-`n` `F256` vector, preferring a pooled buffer; falls back to a
+/// fresh uninitialized allocation. UNINITIALIZED contents — same
+/// write-before-read contract as [`take_f128`].
+pub fn take_f256(n: usize) -> Vec<F256> {
+    if let Some(v) = try_take_f256(n) {
+        return v;
+    }
+    crate::alloc_uninit_vec(n)
+}
+
+/// Pool-only variant of [`take_f256`]: returns `None` instead of allocating.
+pub(crate) fn try_take_f256(n: usize) -> Option<Vec<F256>> {
+    let mut pool = POOL_256.lock().unwrap();
+    let mut best: Option<usize> = None;
+    for (i, v) in pool.iter().enumerate() {
+        if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+            best = Some(i);
+        }
+    }
+    if let Some(i) = best {
+        let mut v = pool.swap_remove(i);
+        drop(pool);
+        v.clear();
+        // SAFETY: capacity ≥ n checked above; F256: Copy (no Drop).
+        unsafe { v.set_len(n) };
+        return Some(v);
+    }
+    None
+}
+
+/// Return an `F256` buffer to the pool for reuse. Same eviction policy as
+/// [`give_f128`].
+pub fn give_f256(v: Vec<F256>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let mut pool = POOL_256.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_POOLED {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(smallest);
+    }
+}
+
 /// Release every pooled buffer back to the OS.
 pub fn clear() {
     POOL.lock().unwrap().clear();
+    POOL_256.lock().unwrap().clear();
 }
 
 #[cfg(test)]

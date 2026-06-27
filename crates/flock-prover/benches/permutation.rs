@@ -17,7 +17,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use flock_prover::challenger::{Challenger, FsChallenger};
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::permutation::{PermutationProof, prove, verify};
 
 struct Rng(u64);
@@ -32,8 +32,11 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128::new(self.next_u64(), self.next_u64())
+    fn f256(&mut self) -> F256 {
+        F256::new(
+            F128::new(self.next_u64(), self.next_u64()),
+            F128::new(self.next_u64(), self.next_u64()),
+        )
     }
     fn permutation(&mut self, n: usize) -> Vec<usize> {
         let mut p: Vec<usize> = (0..n).collect();
@@ -47,30 +50,30 @@ impl Rng {
 
 /// Honest instance: random `g`, permutation `σ`, and `f(x) = g(σ⁻¹(x))` so the
 /// multiset `{(f, s_id)} = {(g, s_σ)}` holds and `∏ h = 1`.
-fn honest_instance(mu: usize, seed: u64) -> (Vec<F128>, Vec<F128>, Vec<usize>) {
+fn honest_instance(mu: usize, seed: u64) -> (Vec<F256>, Vec<F256>, Vec<usize>) {
     let n = 1usize << mu;
     let mut rng = Rng::new(seed);
-    let g: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+    let g: Vec<F256> = (0..n).map(|_| rng.f256()).collect();
     let sigma = rng.permutation(n);
     let mut sinv = vec![0usize; n];
     for (x, &sx) in sigma.iter().enumerate() {
         sinv[sx] = x;
     }
-    let f: Vec<F128> = (0..n).map(|x| g[sinv[x]]).collect();
+    let f: Vec<F256> = (0..n).map(|x| g[sinv[x]]).collect();
     (f, g, sigma)
 }
 
 /// Absorb the statement `(f, g, σ)` into the transcript — the PIOP caller
 /// contract for `prove`/`verify`.
-fn bind<C: Challenger>(ch: &mut C, f: &[F128], g: &[F128], sigma: &[usize]) {
-    ch.observe_f128_slice(f);
-    ch.observe_f128_slice(g);
+fn bind<C: Challenger>(ch: &mut C, f: &[F256], g: &[F256], sigma: &[usize]) {
+    ch.observe_f256_slice(f);
+    ch.observe_f256_slice(g);
     for &s in sigma {
         ch.observe_f128(F128::new(s as u64, 0));
     }
 }
 
-fn run_prove(f: &[F128], g: &[F128], sigma: &[usize]) -> PermutationProof {
+fn run_prove(f: &[F256], g: &[F256], sigma: &[usize]) -> PermutationProof {
     let mut ch = FsChallenger::new(b"flock-perm-bench-v0");
     bind(&mut ch, f, g, sigma);
     prove(f, g, sigma, &mut ch).0
@@ -109,7 +112,7 @@ fn main() {
             let t0 = Instant::now();
             let (p, _claim) = prove(black_box(&f), black_box(&g), black_box(&sigma), &mut ch);
             best_prove = best_prove.min(t0.elapsed().as_secs_f64() * 1e3);
-            cs ^= p.claimed_product.lo ^ p.v_0x.lo ^ p.v_1x.lo;
+            cs ^= p.claimed_product.c0.lo ^ p.v_0x.c0.lo ^ p.v_1x.c0.lo;
             proof = p;
         }
 
@@ -121,7 +124,7 @@ fn main() {
             let t0 = Instant::now();
             let claim = verify(mu, black_box(&proof), &mut ch).expect("verify");
             best_verify = best_verify.min(t0.elapsed().as_secs_f64() * 1e3);
-            cs ^= claim.rho[0].lo;
+            cs ^= claim.rho[0].c0.lo;
         }
 
         let backend = match &proof.v_open {

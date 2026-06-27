@@ -5,7 +5,7 @@
 //! prover then runs `pcs::open_batch` against the saved `commitment` /
 //! `prover_data` to attest to those evals. This bench:
 //!
-//!  1. Generates random packed witnesses (no real R1CS — random F128 inputs
+//!  1. Generates random packed witnesses (no real R1CS — random F256 inputs
 //!     are fine for cost, since `commit`/`open` are data-independent in time).
 //!  2. Times `pcs::commit`.
 //!  3. Times `pcs::open_batch` at two random points (mimicking the 2-point
@@ -19,7 +19,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::pcs::{PcsParams, commit, open, open_batch, pack_witness};
 
 struct Rng(u64);
@@ -50,13 +50,19 @@ impl Rng {
         }
         v
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
-    fn f128_vec(&mut self, n: usize) -> Vec<F128> {
+    fn f128_vec(&mut self, n: usize) -> Vec<F256> {
         (0..n).map(|_| self.f128()).collect()
     }
 }
@@ -88,8 +94,8 @@ fn bench_one(m: usize) {
     // (Per pcs.rs docstring: "the multilinear portion of the QuirkyPoint
     //  with length m − 6".)
     let x_len = m - 6;
-    let x_ab: Vec<F128> = rng.f128_vec(x_len);
-    let x_c: Vec<F128> = rng.f128_vec(x_len);
+    let x_ab: Vec<F256> = rng.f128_vec(x_len);
+    let x_c: Vec<F256> = rng.f128_vec(x_len);
 
     // ---- Warm-up (prime any OnceLock caches / page allocator). ----
     {

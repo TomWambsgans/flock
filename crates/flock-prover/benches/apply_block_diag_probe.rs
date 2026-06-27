@@ -16,7 +16,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::r1cs::{SparseBinaryMatrix, apply_block_diag_packed};
 
 struct Rng(u64);
@@ -28,10 +28,16 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
@@ -43,15 +49,15 @@ impl Rng {
 
 fn apply_block_diag_packed_old(
     m_0: &SparseBinaryMatrix,
-    z_packed: &[F128],
+    z_packed: &[F256],
     m: usize,
     k_log: usize,
-) -> Vec<F128> {
+) -> Vec<F256> {
     use rayon::prelude::*;
     let k = 1usize << k_log;
     let n_packed = 1usize << (m - 7);
     assert_eq!(z_packed.len(), n_packed);
-    let mut out = vec![F128::ZERO; n_packed];
+    let mut out = vec![F256::ZERO; n_packed];
     let f128_per_block = k / 128;
     out.par_chunks_mut(f128_per_block)
         .zip(z_packed.par_chunks(f128_per_block))
@@ -63,8 +69,8 @@ fn apply_block_diag_packed_old(
 
 fn apply_one_block_aligned_old(
     m_0: &SparseBinaryMatrix,
-    z_block: &[F128],
-    out_block: &mut [F128],
+    z_block: &[F256],
+    out_block: &mut [F256],
     k: usize,
 ) {
     let z_u128: &[u128] =
@@ -83,9 +89,12 @@ fn apply_one_block_aligned_old(
         }
         if acc != 0 {
             let cur = out_block[out_idx];
-            out_block[out_idx] = F128 {
-                lo: cur.lo | (acc as u64),
-                hi: cur.hi | ((acc >> 64) as u64),
+            out_block[out_idx] = F256 {
+                c0: F128 {
+                    lo: cur.c0.lo | (acc as u64),
+                    hi: cur.c0.hi | ((acc >> 64) as u64),
+                },
+                c1: cur.c1,
             };
         }
     }
@@ -132,17 +141,17 @@ fn flatten_csr_local(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 
 fn apply_block_diag_packed_strip64(
     m_0: &SparseBinaryMatrix,
-    z_packed: &[F128],
+    z_packed: &[F256],
     m: usize,
     k_log: usize,
-) -> Vec<F128> {
+) -> Vec<F256> {
     use rayon::prelude::*;
     let k = 1usize << k_log;
     let n_packed = 1usize << (m - 7);
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
     let (row_ptr, cols) = flatten_csr_local(m_0);
-    let mut out = vec![F128::ZERO; n_packed];
+    let mut out = vec![F256::ZERO; n_packed];
 
     const S: usize = 64;
     out.par_chunks_mut(S * f128_per_block)
@@ -195,7 +204,7 @@ fn apply_block_diag_packed_strip64(
     out
 }
 
-fn best_of<F: FnMut() -> Vec<F128>>(n: usize, mut f: F) -> (f64, Vec<F128>) {
+fn best_of<F: FnMut() -> Vec<F256>>(n: usize, mut f: F) -> (f64, Vec<F256>) {
     let mut best = f64::INFINITY;
     let mut out = Vec::new();
     for _ in 0..n {
@@ -212,7 +221,7 @@ fn probe(name: &str, a_0: &SparseBinaryMatrix, k_log: usize, n_log: usize, runs:
     let nnz: usize = a_0.rows.iter().map(|r| r.len()).sum();
     let n_outer = 1usize << n_log;
     let mut rng = Rng(0xD1A6 ^ m as u64);
-    let z: Vec<F128> = (0..(1usize << (m - 7))).map(|_| rng.f128()).collect();
+    let z: Vec<F256> = (0..(1usize << (m - 7))).map(|_| rng.f128()).collect();
 
     let (t_old, out_old) = best_of(runs, || apply_block_diag_packed_old(a_0, &z, m, k_log));
     let (t_new, out_new) = best_of(runs, || apply_block_diag_packed(a_0, &z, m, k_log));

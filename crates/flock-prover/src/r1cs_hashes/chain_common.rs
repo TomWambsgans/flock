@@ -17,7 +17,7 @@
 //! so the chain claim's selector is a single bit-flip in the multilinear cube.
 
 use flock_core::challenger::Challenger;
-use flock_core::field::F128;
+use flock_core::field::F256;
 use flock_core::lincheck::build_eq_table;
 use flock_core::pcs::{
     Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef, PcsParams,
@@ -46,7 +46,7 @@ pub struct ChainLayout {
 
 impl ChainLayout {
     /// Length of the packed-position fold coord `τ_pos` = `region_log − LOG_PACKING`.
-    /// One `F128` per packed position within a region's 2^region_log-bit slot.
+    /// One `F256` per packed position within a region's 2^region_log-bit slot.
     #[inline]
     pub fn tau_pos_len(&self) -> usize {
         self.region_log - LOG_PACKING
@@ -63,15 +63,15 @@ impl ChainLayout {
 
 /// Packed-level fold parameters: `τ_pos` binds the packed-position dimension of
 /// each region. The verifier samples `τ_pos`, then the prover folds each
-/// instance's input/output region down to one `F128` via
+/// instance's input/output region down to one `F256` via
 /// `Σ_{pos} eq(τ_pos, pos) · ẑ_packed[(inst, slot, pos)]`.
 #[derive(Clone, Debug)]
 pub struct ChainFold {
-    pub tau_pos: Vec<F128>,
+    pub tau_pos: Vec<F256>,
 }
 
 impl ChainFold {
-    pub fn new(layout: &ChainLayout, tau_pos: Vec<F128>) -> Self {
+    pub fn new(layout: &ChainLayout, tau_pos: Vec<F256>) -> Self {
         assert_eq!(
             tau_pos.len(),
             layout.tau_pos_len(),
@@ -81,15 +81,15 @@ impl ChainFold {
     }
 
     /// Fold a public endpoint (given as `region_bits` bools in physical
-    /// within-slot order) to a single `F128` — the τ_pos-MLE of the endpoint
+    /// within-slot order) to a single `F256` — the τ_pos-MLE of the endpoint
     /// over the region's packed positions. Mirrors what the prover computes
     /// against the committed witness.
     ///
-    /// Algorithm: pack the bits into `2^τ_pos_len` `F128` elements (padding the
+    /// Algorithm: pack the bits into `2^τ_pos_len` `F256` elements (padding the
     /// region's `region_bits..slot_bits` tail with zeros to match the witness
     /// layout), then take the inner product with `eq(τ_pos, ·)`.
-    pub fn fold_public_phys(&self, phys_bits: &[bool]) -> F128 {
-        let bits_per_packed = 1usize << LOG_PACKING; // 128
+    pub fn fold_public_phys(&self, phys_bits: &[bool]) -> F256 {
+        let bits_per_packed = 1usize << LOG_PACKING; // 256
         let n_packed = 1usize << self.tau_pos.len();
         let slot_bits = n_packed * bits_per_packed;
         assert!(
@@ -100,16 +100,22 @@ impl ChainFold {
         );
 
         let eq_tau = build_eq_table(&self.tau_pos);
-        let mut acc = F128::ZERO;
+        let mut acc = F256::ZERO;
         for pos in 0..n_packed {
-            let mut packed = F128::ZERO;
+            // The 256 bits of one packed element map to the four LE u64 words
+            // [c0.lo, c0.hi, c1.lo, c1.hi] — bit `b` lives in word `b / 64` at
+            // sub-bit `b % 64`, matching the committed witness's F256 layout.
+            let mut packed = F256::ZERO;
             for b in 0..bits_per_packed {
                 let bit_idx = pos * bits_per_packed + b;
                 if bit_idx < phys_bits.len() && phys_bits[bit_idx] {
-                    if b < 64 {
-                        packed.lo |= 1u64 << b;
-                    } else {
-                        packed.hi |= 1u64 << (b - 64);
+                    let word = b / 64;
+                    let sub = b % 64;
+                    match word {
+                        0 => packed.c0.lo |= 1u64 << sub,
+                        1 => packed.c0.hi |= 1u64 << sub,
+                        2 => packed.c1.lo |= 1u64 << sub,
+                        _ => packed.c1.hi |= 1u64 << sub,
                     }
                 }
             }
@@ -125,16 +131,16 @@ impl ChainFold {
 /// instances.
 ///
 /// Replaces the prior bit-level byte-table fold over `region_bits` per
-/// instance; here the per-instance work is just `2^τ_pos_len` F128
-/// mul-adds (16 for keccak, 2 for blake3/sha2).
+/// instance; here the per-instance work is just `2^τ_pos_len` F256
+/// mul-adds (8 for keccak, 1 for blake3/sha2).
 pub fn fold_in_out(
     layout: &ChainLayout,
-    packed: &[F128],
+    packed: &[F256],
     fold: &ChainFold,
-) -> (Vec<F128>, Vec<F128>) {
+) -> (Vec<F256>, Vec<F256>) {
     use rayon::prelude::*;
 
-    let bits_per_packed = 1usize << LOG_PACKING; // 128
+    let bits_per_packed = 1usize << LOG_PACKING; // 256
     let n_packed_per_region = 1usize << fold.tau_pos.len();
     let block_packed = (1usize << layout.k_log) / bits_per_packed;
     let in_pos_base = (layout.input_byte_off * 8) / bits_per_packed;
@@ -148,19 +154,19 @@ pub fn fold_in_out(
 
     let eq_tau = build_eq_table(&fold.tau_pos);
 
-    let fold_one = |base: usize| -> F128 {
-        let mut acc = F128::ZERO;
+    let fold_one = |base: usize| -> F256 {
+        let mut acc = F256::ZERO;
         for pos in 0..n_packed_per_region {
             acc += eq_tau[pos] * packed[base + pos];
         }
         acc
     };
 
-    let in_vals: Vec<F128> = (0..n_inst)
+    let in_vals: Vec<F256> = (0..n_inst)
         .into_par_iter()
         .map(|i| fold_one(i * block_packed + in_pos_base))
         .collect();
-    let out_vals: Vec<F128> = (0..n_inst)
+    let out_vals: Vec<F256> = (0..n_inst)
         .into_par_iter()
         .map(|i| fold_one(i * block_packed + out_pos_base))
         .collect();
@@ -190,7 +196,7 @@ pub fn assemble_chain_claim(
     let mut point = Vec::with_capacity(point_len);
     point.extend_from_slice(&fold.tau_pos);
     point.push(claims.sel0);
-    point.extend(std::iter::repeat_n(F128::ZERO, high));
+    point.extend(std::iter::repeat_n(F256::ZERO, high));
     point.extend_from_slice(&claims.instance_point);
     debug_assert_eq!(point.len(), point_len);
 
@@ -210,13 +216,13 @@ fn build_chain_claim_point(
     layout: &ChainLayout,
     fold: &ChainFold,
     claims: &crate::chain::ChainClaims,
-) -> Vec<F128> {
+) -> Vec<F256> {
     let high = layout.high_zeros();
     let point_len = fold.tau_pos.len() + 1 + high + claims.instance_point.len();
     let mut point = Vec::with_capacity(point_len);
     point.extend_from_slice(&fold.tau_pos);
     point.push(claims.sel0);
-    point.extend(std::iter::repeat_n(F128::ZERO, high));
+    point.extend(std::iter::repeat_n(F256::ZERO, high));
     point.extend_from_slice(&claims.instance_point);
     debug_assert_eq!(point.len(), point_len);
     point
@@ -263,9 +269,9 @@ pub fn prove_chain_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     layout: &ChainLayout,
-    z_packed: Vec<F128>,
-    a_packed: Vec<F128>,
-    b_packed: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed: Vec<F256>,
+    b_packed: Vec<F256>,
     z_lincheck: Vec<u8>,
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
@@ -303,7 +309,7 @@ pub fn prove_chain_generic<Ch: Challenger>(
     } else {
         None
     };
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = challenger.sample_f256_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
     let (in_vals, out_vals) = fold_in_out(layout, &core.z_packed, &fold);
     if let Some(t) = t {
@@ -342,8 +348,8 @@ pub fn prove_chain_generic<Ch: Challenger>(
     };
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
-    let pre_ab: Option<&[flock_core::field::F128]> = core.s_hat_v_ab.as_deref();
-    let pre_c: Option<&[flock_core::field::F128]> = Some(core.s_hat_v_c.as_slice());
+    let pre_ab: Option<&[flock_core::field::F256]> = None /* PERF TODO(f256): s_hat_v_ab z_vec path */;
+    let pre_c: Option<&[flock_core::field::F256]> = None /* PERF TODO(f256): s_hat_v_c 128-wide */;
     let pcs_open = flock_core::pcs::open_batch_mixed_with_precomputed_s_hat_v(
         &core.z_packed,
         &core.prover_data,
@@ -381,9 +387,9 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     layout: &ChainLayout,
-    z_packed: Vec<F128>,
-    a_packed: Vec<F128>,
-    b_packed: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed: Vec<F256>,
+    b_packed: Vec<F256>,
     z_lincheck: Vec<u8>,
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
@@ -407,7 +413,7 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
         challenger,
     );
 
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = challenger.sample_f256_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
     let (in_vals, out_vals) = fold_in_out(layout, &core.z_packed, &fold);
 
@@ -432,8 +438,8 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
         s_hat_v_c,
         ..
     } = core;
-    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_ab: Option<&[F256]> = None /* PERF TODO(f256): s_hat_v_ab z_vec path */;
+    let pre_c: Option<&[F256]> = None /* PERF TODO(f256): s_hat_v_c 128-wide */;
     let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         &prover_data,
@@ -481,7 +487,7 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
     )
     .map_err(ChainVerifyError::R1cs)?;
 
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = challenger.sample_f256_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
 
     let x0_r = fold.fold_public_phys(x0_phys);
@@ -565,7 +571,7 @@ pub fn verify_chain_generic<Ch: Challenger>(
 
     // ---- Packed-pos fold parameters (matches prover transcript order).
     let t = std::time::Instant::now();
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = challenger.sample_f256_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
 
     // ---- Verify the shift sumcheck; fold public endpoints with same τ_pos.

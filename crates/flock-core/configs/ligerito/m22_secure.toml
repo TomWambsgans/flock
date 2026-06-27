@@ -1,7 +1,7 @@
 m = 22
-log_n = 15
+log_n = 14
 initial_k = 6
-target_security_bits = 120
+target_security_bits = 128
 analysis_version = "no_row_union_over_ben_sasson_2025_cor_1_4"
 field = "f128"
 hash = "sha256"
@@ -9,48 +9,33 @@ grinding_step = "post_commit_pre_queries"
 
 [[levels]]
 log_inv_rate = 1
-log_msg_cols = 9
+log_msg_cols = 8
 log_num_interleaved = 6
 k_recursive = 6
 regime = "udr"
 proximity_loss = 0.0
-queries = 298
+queries = 326
 grinding_bits = 0
 fold_grinding_bits = 0
 ood_samples = 0
-target_security_bits = 120
-expected_eps_pg_bits = 120.0
-expected_eps_query_bits = 120.3
+target_security_bits = 128
+expected_eps_pg_bits = 249.1
+expected_eps_query_bits = 128.0
 
 [[levels]]
-log_inv_rate = 2
-log_msg_cols = 6
+log_inv_rate = 3
+log_msg_cols = 5
 log_num_interleaved = 3
 k_recursive = 3
 regime = "udr"
 proximity_loss = 0.0
-queries = 187
+queries = 161
 grinding_bits = 0
 fold_grinding_bits = 0
 ood_samples = 0
-target_security_bits = 120
-expected_eps_pg_bits = 121.5
-expected_eps_query_bits = 120.1
-
-[[levels]]
-log_inv_rate = 5
-log_msg_cols = 3
-log_num_interleaved = 3
-k_recursive = 3
-regime = "udr"
-proximity_loss = 0.0
-queries = 131
-grinding_bits = 0
-fold_grinding_bits = 0
-ood_samples = 0
-target_security_bits = 120
-expected_eps_pg_bits = 121.1
-expected_eps_query_bits = 120.8
+target_security_bits = 128
+expected_eps_pg_bits = 249.2
+expected_eps_query_bits = 128.2
 
 [final_block]
-yr_log_n = 3
+yr_log_n = 5

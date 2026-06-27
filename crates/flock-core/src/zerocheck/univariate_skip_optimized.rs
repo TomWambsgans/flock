@@ -33,11 +33,11 @@
 use std::sync::OnceLock;
 
 use crate::field::gf2_8::gf8_reduce;
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
+use crate::field::{F8, F128, F256, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
+use super::univariate_skip::{SplitEqGhash, ntt_extend_f256_vec_ghash, pack_bits};
 
 // ---------------------------------------------------------------------------
 // Protocol constants — fixed by the optimization design.
@@ -769,9 +769,9 @@ pub fn round1_shift_reduce_extract_c(
     c: &[bool],
     m: usize,
     k_skip: usize,
-    r: &[F128],
+    r: &[F256],
     inv_table: &InvNttTableByteSingleGf8,
-) -> (Vec<F128>, Vec<F128>) {
+) -> (Vec<F256>, Vec<F256>) {
     assert_eq!(a.len(), 1usize << m);
     assert_eq!(b.len(), 1usize << m);
     assert_eq!(c.len(), 1usize << m);
@@ -783,27 +783,27 @@ pub fn round1_shift_reduce_extract_c(
 
 // Per-worker scratch + local accumulator. ~6 KB total, stack-allocated.
 struct WorkerState {
-    partial_ab: [F128; ELL],
-    partial_c: [F128; ELL],
+    partial_ab: [F256; ELL],
+    partial_c: [F256; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
     b_col: [F8; ELL],
-    local_res_ab: [F128; ELL],
-    local_res_c_s: [F128; ELL],
+    local_res_ab: [F256; ELL],
+    local_res_c_s: [F256; ELL],
 }
 
 impl WorkerState {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c: [F128::ZERO; ELL],
+            partial_ab: [F256::ZERO; ELL],
+            partial_c: [F256::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
-            local_res_ab: [F128::ZERO; ELL],
-            local_res_c_s: [F128::ZERO; ELL],
+            local_res_ab: [F256::ZERO; ELL],
+            local_res_c_s: [F256::ZERO; ELL],
         }
     }
 }
@@ -833,13 +833,13 @@ fn process_one_x_hi(
     b_packed: &[u8],
     c_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
-    eq_lo_scaled: &[F128],
-    eq_hi_val: F128,
+    eq_lo_scaled: &[F256],
+    eq_hi_val: F256,
     convert: &[F128],
     state: &mut WorkerState,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_ab.iter_mut().for_each(|p| *p = F256::ZERO);
+    state.partial_c.iter_mut().for_each(|p| *p = F256::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -1018,31 +1018,31 @@ fn process_one_x_hi(
 /// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
 /// split into bank 0 / bank 1.
 struct WorkerStateWithSHatV {
-    partial_ab: [F128; ELL],
-    partial_c_0: [F128; ELL],
-    partial_c_1: [F128; ELL],
+    partial_ab: [F256; ELL],
+    partial_c_0: [F256; ELL],
+    partial_c_1: [F256; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
     b_col: [F8; ELL],
-    local_res_ab: [F128; ELL],
-    local_res_c_s_0: [F128; ELL],
-    local_res_c_s_1: [F128; ELL],
+    local_res_ab: [F256; ELL],
+    local_res_c_s_0: [F256; ELL],
+    local_res_c_s_1: [F256; ELL],
 }
 
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c_0: [F128::ZERO; ELL],
-            partial_c_1: [F128::ZERO; ELL],
+            partial_ab: [F256::ZERO; ELL],
+            partial_c_0: [F256::ZERO; ELL],
+            partial_c_1: [F256::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
-            local_res_ab: [F128::ZERO; ELL],
-            local_res_c_s_0: [F128::ZERO; ELL],
-            local_res_c_s_1: [F128::ZERO; ELL],
+            local_res_ab: [F256::ZERO; ELL],
+            local_res_c_s_0: [F256::ZERO; ELL],
+            local_res_c_s_1: [F256::ZERO; ELL],
         }
     }
 }
@@ -1062,14 +1062,14 @@ fn process_one_x_hi_with_s_hat_v(
     b_packed: &[u8],
     c_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
-    eq_lo_scaled: &[F128],
-    eq_hi_val: F128,
+    eq_lo_scaled: &[F256],
+    eq_hi_val: F256,
     convert: &[F128],
     state: &mut WorkerStateWithSHatV,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_ab.iter_mut().for_each(|p| *p = F256::ZERO);
+    state.partial_c_0.iter_mut().for_each(|p| *p = F256::ZERO);
+    state.partial_c_1.iter_mut().for_each(|p| *p = F256::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -1309,9 +1309,9 @@ pub fn round1_shift_reduce_extract_c_packed(
     c_packed: &[u8],
     m: usize,
     k_skip: usize,
-    r: &[F128],
+    r: &[F256],
     inv_table: &InvNttTableByteSingleGf8,
-) -> (Vec<F128>, Vec<F128>) {
+) -> (Vec<F256>, Vec<F256>) {
     round1_shift_reduce_extract_c_packed_padded(
         a_packed,
         b_packed,
@@ -1334,10 +1334,10 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     c_packed: &[u8],
     m: usize,
     k_skip: usize,
-    r: &[F128],
+    r: &[F256],
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>) {
+) -> (Vec<F256>, Vec<F256>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -1358,8 +1358,10 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
 
+    // `d_inv` is a protocol-fixed F128 subfield constant (medium-eq
+    // normalization); absorb it into the (now F256) eq_lo via `mul_f128`.
     let d_inv_val = d_inv();
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let eq_lo_scaled: Vec<F256> = eq.lo.iter().map(|v| v.mul_f128(d_inv_val)).collect();
     let convert = convert_table();
     let eq_hi = &eq.hi;
 
@@ -1367,7 +1369,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
 
     // Parallel fold: each worker accumulates a subset of x_hi values into its
     // own WorkerState. Reduce step combines the per-worker `local_res_*` by
-    // per-lane F128 XOR.
+    // per-lane F256 XOR.
     let (res_ab, res_c_s) = (0..hi_size)
         .into_par_iter()
         .fold(WorkerState::new, |mut state, x_hi| {
@@ -1391,7 +1393,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
         })
         .map(|s| (s.local_res_ab, s.local_res_c_s))
         .reduce(
-            || ([F128::ZERO; ELL], [F128::ZERO; ELL]),
+            || ([F256::ZERO; ELL], [F256::ZERO; ELL]),
             |(mut ab1, mut c1), (ab2, c2)| {
                 for i in 0..ELL {
                     ab1[i] += ab2[i];
@@ -1401,7 +1403,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
             },
         );
 
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    let res_c_lifted = ntt_extend_f256_vec_ghash(&res_c_s, inv_table);
     (res_ab.to_vec(), res_c_lifted)
 }
 
@@ -1426,10 +1428,10 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     c_packed: &[u8],
     m: usize,
     k_skip: usize,
-    r: &[F128],
+    r: &[F256],
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F256>, Vec<F256>, Vec<F256>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -1451,7 +1453,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     let n_lo_and_inner = eq.n_lo + N_INNER;
 
     let d_inv_val = d_inv();
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let eq_lo_scaled: Vec<F256> = eq.lo.iter().map(|v| v.mul_f128(d_inv_val)).collect();
     let convert = convert_table();
     let eq_hi = &eq.hi;
 
@@ -1480,7 +1482,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
         })
         .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
         .reduce(
-            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+            || ([F256::ZERO; ELL], [F256::ZERO; ELL], [F256::ZERO; ELL]),
             |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
                 for i in 0..ELL {
                     ab1[i] += ab2[i];
@@ -1493,18 +1495,20 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 
     // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
     // F_2-linearity of φ_8 over the masked-byte sum).
-    let mut res_c_s_combined = [F128::ZERO; ELL];
+    let mut res_c_s_combined = [F256::ZERO; ELL];
     for i in 0..ELL {
         res_c_s_combined[i] = res_c_s_0[i] + res_c_s_1[i];
     }
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s_combined, inv_table);
+    let res_c_lifted = ntt_extend_f256_vec_ghash(&res_c_s_combined, inv_table);
 
     // s_hat_v_c canonical form: apply residual C_2 (small-eq constant for
-    // r[k_skip+1..k_skip+3]) and α⁻¹ (strips bank 1's extra α factor).
+    // r[k_skip+1..k_skip+3]) and α⁻¹ (strips bank 1's extra α factor). Both are
+    // F128 subfield constants; the bank values are F256, so scale via the
+    // `F128 × F256` mixed-field product.
     let c_2 = c_2_small_f128();
     let alpha_inv = alpha_inv_f128();
     let c_2_alpha_inv = c_2 * alpha_inv;
-    let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
+    let mut s_hat_v_c = vec![F256::ZERO; 2 * ELL];
     for lane in 0..ELL {
         s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
         s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
@@ -1524,9 +1528,9 @@ fn round1_shift_reduce_extract_c_packed_serial(
     c_packed: &[u8],
     m: usize,
     k_skip: usize,
-    r: &[F128],
+    r: &[F256],
     inv_table: &InvNttTableByteSingleGf8,
-) -> (Vec<F128>, Vec<F128>) {
+) -> (Vec<F256>, Vec<F256>) {
     assert_eq!(k_skip, K_SKIP);
     assert!(m >= k_skip + N_INNER);
     let total_bytes = (1usize << m) / 8;
@@ -1542,7 +1546,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
     let n_lo_and_inner = eq.n_lo + N_INNER;
 
     let d_inv_val = d_inv();
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let eq_lo_scaled: Vec<F256> = eq.lo.iter().map(|v| v.mul_f128(d_inv_val)).collect();
     let convert = convert_table();
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(&PaddingSpec::dense(m));
@@ -1566,7 +1570,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
         );
     }
 
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&state.local_res_c_s, inv_table);
+    let res_c_lifted = ntt_extend_f256_vec_ghash(&state.local_res_c_s, inv_table);
     (state.local_res_ab.to_vec(), res_c_lifted)
 }
 
@@ -1655,26 +1659,33 @@ mod tests {
                 hi: self.next_u64(),
             }
         }
+        fn f256(&mut self) -> F256 {
+            F256 {
+                c0: self.f128(),
+                c1: self.f128(),
+            }
+        }
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.bit()).collect()
         }
-        fn f128_vec(&mut self, n: usize) -> Vec<F128> {
-            (0..n).map(|_| self.f128()).collect()
+        fn f256_vec(&mut self, n: usize) -> Vec<F256> {
+            (0..n).map(|_| self.f256()).collect()
         }
     }
 
     /// Build the full `r` vector with the protocol-fixed constants in the
     /// small/medium slots. Only `r[k_skip + N_INNER..]` is the actual
-    /// randomness fed to the optimized URM.
-    fn build_protocol_r(m: usize, outer: &[F128]) -> Vec<F128> {
+    /// randomness fed to the optimized URM. The small/medium constants are F128
+    /// subfield elements embedded into F256; the outer challenges are F256.
+    fn build_protocol_r(m: usize, outer: &[F256]) -> Vec<F256> {
         assert_eq!(outer.len(), m - K_SKIP - N_INNER);
-        let mut r = vec![F128::ZERO; m];
+        let mut r = vec![F256::ZERO; m];
         // r[0..K_SKIP]: not used by either function — can be anything.
         for (i, &small) in small_challenges_ghash().iter().enumerate() {
-            r[K_SKIP + i] = small;
+            r[K_SKIP + i] = F256::from_f128(small);
         }
         for (i, &med) in medium_challenges_ghash().iter().enumerate() {
-            r[K_SKIP + 3 + i] = med;
+            r[K_SKIP + 3 + i] = F256::from_f128(med);
         }
         for (i, &x) in outer.iter().enumerate() {
             r[K_SKIP + N_INNER + i] = x;
@@ -1695,7 +1706,7 @@ mod tests {
         let a = rng.bits(1 << m);
         let b = rng.bits(1 << m);
         let c = rng.bits(1 << m);
-        let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+        let outer = rng.f256_vec(m - K_SKIP - N_INNER);
         let r = build_protocol_r(m, &outer);
         let table = make_inv_table();
 
@@ -1711,7 +1722,7 @@ mod tests {
         let a = rng.bits(1 << m);
         let b = rng.bits(1 << m);
         let c = rng.bits(1 << m);
-        let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+        let outer = rng.f256_vec(m - K_SKIP - N_INNER);
         let r = build_protocol_r(m, &outer);
         let table = make_inv_table();
 
@@ -1732,7 +1743,7 @@ mod tests {
             let a = rng.bits(1 << m);
             let b = rng.bits(1 << m);
             let c = rng.bits(1 << m);
-            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let outer = rng.f256_vec(m - K_SKIP - N_INNER);
             let r = build_protocol_r(m, &outer);
             let table = make_inv_table();
 
@@ -1804,7 +1815,7 @@ mod tests {
             let a = rng.bits(1 << m);
             let b = rng.bits(1 << m);
             let c = rng.bits(1 << m);
-            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let outer = rng.f256_vec(m - K_SKIP - N_INNER);
             let r = build_protocol_r(m, &outer);
             let table = make_inv_table();
             let a_p = pack_bits(&a);
@@ -1871,7 +1882,7 @@ mod tests {
                 }
             }
 
-            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let outer = rng.f256_vec(m - K_SKIP - N_INNER);
             let r = build_protocol_r(m, &outer);
             let table = make_inv_table();
             let a_p = pack_bits(&a);
@@ -2044,21 +2055,21 @@ mod tests {
             let a = pack_bits(&rng.bits(1 << m));
             let b = pack_bits(&rng.bits(1 << m));
             let c = pack_bits(&rng.bits(1 << m));
-            let mut r = vec![F128::ZERO; m];
+            let mut r = vec![F256::ZERO; m];
             // Friendly inner constants must match the optimization's
-            // expectations: 3 small + 4 medium ghash.
+            // expectations: 3 small + 4 medium ghash (F128 subfield, embedded).
             for i in 0..3 {
-                r[K_SKIP + i] = phi8(F8(SMALL_CHAL_F8[i]));
+                r[K_SKIP + i] = F256::from_f128(phi8(F8(SMALL_CHAL_F8[i])));
             }
             let medium = crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash();
             for i in 0..4 {
-                r[K_SKIP + 3 + i] = medium[i];
+                r[K_SKIP + 3 + i] = F256::from_f128(medium[i]);
             }
             for i in 0..K_SKIP {
-                r[i] = rng.f128();
+                r[i] = rng.f256();
             }
             for i in (K_SKIP + N_INNER)..m {
-                r[i] = rng.f128();
+                r[i] = rng.f256();
             }
 
             let inv_table = {

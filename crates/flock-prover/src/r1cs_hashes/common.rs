@@ -5,7 +5,7 @@
 use std::sync::OnceLock;
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
-use flock_core::field::F128;
+use flock_core::field::F256;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
@@ -194,7 +194,7 @@ pub(crate) fn build_block_r1cs_with_matrices(
 
 /// Drive the parallel chunked witness build for `n_blocks` instances padded
 /// to `2^n_blocks_log` slots. Returns `(z, a, b, z_lincheck)` packed in
-/// F128 form (z/a/b) and byte-stripe form (z_lincheck).
+/// F256 form (z/a/b) and byte-stripe form (z_lincheck).
 ///
 /// `per_block(initial, z_u64, a_u64, b_u64)` populates one block's worth of
 /// `(z, a, b)` data — 3 zero-initialized `u64`-buffers of length `K / 64`.
@@ -214,14 +214,14 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
     n_blocks_log: usize,
     k_log: usize,
     per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+) -> (Vec<F256>, Vec<F256>, Vec<F256>, Vec<u8>)
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
     use rayon::prelude::*;
 
     let k = 1usize << k_log;
-    let f128_per_block = k / 128;
+    let f256_per_block = k / 256;
     let u64_per_block = k / 64;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = initial_states.len();
@@ -234,21 +234,21 @@ where
         "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
     );
 
-    let total_f128 = n_total * f128_per_block;
+    let total_f256 = n_total * f256_per_block;
     // z/a/b are allocated uninitialized and zeroed *inside* the parallel loop
     // (one memset per 8-block group), so the ~192 MB zero-fill scales with the
     // thread count instead of running serially on the main thread before the
     // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
     // so each group must be zeroed before its `per_block` calls. `z_lincheck`
     // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z = flock_core::scratch::take_f256(total_f256);
+    let mut a = flock_core::scratch::take_f256(total_f256);
+    let mut b = flock_core::scratch::take_f256(total_f256);
     let mut z_lincheck = vec![0u8; (n_total / 8) * k];
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
+    z.par_chunks_mut(8 * f256_per_block)
+        .zip(a.par_chunks_mut(8 * f256_per_block))
+        .zip(b.par_chunks_mut(8 * f256_per_block))
         .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
@@ -256,8 +256,8 @@ where
             // were uninit-allocated). The per-block builder ORs 1-bits into
             // pre-zeroed words; any slot left unbuilt (no padding block) stays
             // zero, which the lincheck transpose below reads correctly.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
+            // SAFETY: F256 is `Copy` (no Drop) and the all-zero bit pattern is
+            // the valid `F256::ZERO`, so a byte memset is a correct init.
             unsafe {
                 std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
                 std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
@@ -275,27 +275,27 @@ where
                     // No padding block — leave this slot zero.
                     continue;
                 };
-                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
-                // LE order — same byte layout as a u64 pair.
+                let z_chunk = &mut z_grp[k_in * f256_per_block..(k_in + 1) * f256_per_block];
+                let a_chunk = &mut a_grp[k_in * f256_per_block..(k_in + 1) * f256_per_block];
+                let b_chunk = &mut b_grp[k_in * f256_per_block..(k_in + 1) * f256_per_block];
+                // SAFETY: F256 is `repr(C, align(32))` with four `u64` words in
+                // LE order — same byte layout as a u64 quadruple.
                 let z_u64: &mut [u64] = unsafe {
                     std::slice::from_raw_parts_mut(
                         z_chunk.as_mut_ptr() as *mut u64,
-                        z_chunk.len() * 2,
+                        z_chunk.len() * 4,
                     )
                 };
                 let a_u64: &mut [u64] = unsafe {
                     std::slice::from_raw_parts_mut(
                         a_chunk.as_mut_ptr() as *mut u64,
-                        a_chunk.len() * 2,
+                        a_chunk.len() * 4,
                     )
                 };
                 let b_u64: &mut [u64] = unsafe {
                     std::slice::from_raw_parts_mut(
                         b_chunk.as_mut_ptr() as *mut u64,
-                        b_chunk.len() * 2,
+                        b_chunk.len() * 4,
                     )
                 };
                 per_block(init, z_u64, a_u64, b_u64);
@@ -303,7 +303,7 @@ where
 
             // Bit-transpose 8 z chunks into the lincheck stripe.
             let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 4)
             };
             for i in 0..u64_per_block {
                 let lanes: [u64; 8] = [
@@ -342,4 +342,3 @@ pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
     }
     out
 }
-

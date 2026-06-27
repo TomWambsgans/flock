@@ -9,7 +9,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::pcs::ring_switch::{
     build_eq_split, fold_1b_rows_1way_mfr_8wide_k4, fold_1b_rows_1way_mfr_16wide_k4,
     fold_1b_rows_2way_mfr_8wide_padded, fold_1b_rows_split, split_n_lo,
@@ -29,25 +29,31 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn next_f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn next_f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
 
 fn bench_one(m: usize, n_runs: usize) {
-    // packed_witness has 2^(m - LOG_PACKING) = 2^(m-7) F128 elements; the suffix
+    // packed_witness has 2^(m - LOG_PACKING) = 2^(m-7) F256 elements; the suffix
     // point r has that many coords.
     let lbits = m - 7;
     let len = 1usize << lbits;
     let mut rng = Rng::new(0xF01D ^ m as u64);
-    let witness: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
+    let witness: Vec<F256> = (0..len).map(|_| rng.next_f128()).collect();
     // t0 is a *real* eq tensor so the split factorization lines up with it.
-    let r: Vec<F128> = (0..lbits).map(|_| rng.next_f128()).collect();
-    let t0: Vec<F128> = build_eq(&r);
-    let t1: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
+    let r: Vec<F256> = (0..lbits).map(|_| rng.next_f128()).collect();
+    let t0: Vec<F256> = build_eq(&r);
+    let t1: Vec<F256> = (0..len).map(|_| rng.next_f128()).collect();
     let padding = PaddingSpec::dense(m);
 
     let bench = |label: &str, f: &dyn Fn() -> f64| {

@@ -43,7 +43,7 @@
 //! deferred reductions, shift-reduce, SIMD) parallel `univariate_skip_optimized.rs`
 //! and would land later; this file is the algorithmic skeleton.
 
-use crate::field::{F8, F128, phi8};
+use crate::field::{F8, F256, phi8};
 use crate::ntt::AdditiveNttGf8;
 
 use super::univariate_skip::build_eq;
@@ -89,8 +89,8 @@ pub fn round1_deg4_naive(
     d: &[bool],
     z: &[bool],
     m: usize,
-    r: &[F128],
-) -> (Vec<F128>, Vec<F128>) {
+    r: &[F256],
+) -> (Vec<F256>, Vec<F256>) {
     assert!(K_SKIP <= m, "K_SKIP must be ≤ m");
     let n = 1usize << m;
     assert_eq!(a.len(), n);
@@ -111,8 +111,8 @@ pub fn round1_deg4_naive(
     let eq_full = build_eq(&r[K_SKIP..]);
     debug_assert_eq!(eq_full.len(), n_chunks_x);
 
-    let mut p_abcd = vec![F128::ZERO; LAMBDA4_SIZE];
-    let mut p_z = vec![F128::ZERO; LAMBDA4_SIZE];
+    let mut p_abcd = vec![F256::ZERO; LAMBDA4_SIZE];
+    let mut p_z = vec![F256::ZERO; LAMBDA4_SIZE];
 
     // Scratch buffers — one V₈-sized buffer per factor.
     let mut a_col = vec![F8::ZERO; V8_SIZE];
@@ -159,8 +159,9 @@ pub fn round1_deg4_naive(
         for i in 0..LAMBDA4_SIZE {
             let lam = S_SIZE + i;
             let abcd = a_col[lam] * b_col[lam] * c_col[lam] * d_col[lam];
-            p_abcd[i] += eq_x * phi8(abcd);
-            p_z[i] += eq_x * phi8(z_col[lam]);
+            // φ₈(·) is an F128 node embedding; eq weight is F256 → F256 product.
+            p_abcd[i] += eq_x.mul_f128(phi8(abcd));
+            p_z[i] += eq_x.mul_f128(phi8(z_col[lam]));
         }
     }
 
@@ -174,6 +175,7 @@ pub fn round1_deg4_naive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::F128;
 
     struct Rng(u64);
     impl Rng {
@@ -194,6 +196,12 @@ mod tests {
             F128 {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
+            }
+        }
+        fn f256(&mut self) -> F256 {
+            F256 {
+                c0: self.f128(),
+                c1: self.f128(),
             }
         }
     }
@@ -232,7 +240,7 @@ mod tests {
         let c = rng.bits(1 << m);
         let d = rng.bits(1 << m);
         let z = rng.bits(1 << m);
-        let r: Vec<F128> = (0..m).map(|_| rng.f128()).collect();
+        let r: Vec<F256> = (0..m).map(|_| rng.f256()).collect();
         let (p_abcd, p_z) = round1_deg4_naive(&a, &b, &c, &d, &z, m, &r);
         assert_eq!(p_abcd.len(), LAMBDA4_SIZE);
         assert_eq!(p_z.len(), LAMBDA4_SIZE);
@@ -255,7 +263,7 @@ mod tests {
         let c = vec![true; 1 << m];
         let d = vec![true; 1 << m];
         let z = vec![false; 1 << m]; // zero linear term — focus on a·b·c·d
-        let r: Vec<F128> = (0..m).map(|_| rng.f128()).collect();
+        let r: Vec<F256> = (0..m).map(|_| rng.f256()).collect();
 
         // degree-4 message.
         let (p_abcd, _p_z) = round1_deg4_naive(&a, &b, &c, &d, &z, m, &r);
@@ -266,7 +274,7 @@ mod tests {
         let ntt_v8 = AdditiveNttGf8::new(K_V8, F8::ZERO);
         let n_chunks_x = 1usize << (m - K_SKIP);
         let eq_full = build_eq(&r[K_SKIP..]);
-        let mut p_ab_ref = vec![F128::ZERO; LAMBDA4_SIZE];
+        let mut p_ab_ref = vec![F256::ZERO; LAMBDA4_SIZE];
         let mut a_col = vec![F8::ZERO; V8_SIZE];
         let mut b_col = vec![F8::ZERO; V8_SIZE];
         for x_rest in 0..n_chunks_x {
@@ -287,7 +295,7 @@ mod tests {
             let eq_x = eq_full[x_rest];
             for i in 0..LAMBDA4_SIZE {
                 let lam = S_SIZE + i;
-                p_ab_ref[i] += eq_x * phi8(a_col[lam] * b_col[lam]);
+                p_ab_ref[i] += eq_x.mul_f128(phi8(a_col[lam] * b_col[lam]));
             }
         }
 
@@ -312,12 +320,12 @@ mod tests {
         let c = vec![false; 1 << m];
         let d = vec![false; 1 << m];
         let z = rng.bits(1 << m);
-        let r: Vec<F128> = (0..m).map(|_| rng.f128()).collect();
+        let r: Vec<F256> = (0..m).map(|_| rng.f256()).collect();
         let (p_abcd, p_z) = round1_deg4_naive(&a, &b, &c, &d, &z, m, &r);
 
         // p_abcd must be all zero.
         for v in &p_abcd {
-            assert_eq!(*v, F128::ZERO);
+            assert_eq!(*v, F256::ZERO);
         }
 
         // p_z reference: NTT-extend z on each x_rest row, lift via φ₈, weight by eq.
@@ -325,7 +333,7 @@ mod tests {
         let ntt_v8 = AdditiveNttGf8::new(K_V8, F8::ZERO);
         let n_chunks_x = 1usize << (m - K_SKIP);
         let eq_full = build_eq(&r[K_SKIP..]);
-        let mut p_z_ref = vec![F128::ZERO; LAMBDA4_SIZE];
+        let mut p_z_ref = vec![F256::ZERO; LAMBDA4_SIZE];
         let mut z_col = vec![F8::ZERO; V8_SIZE];
         for x_rest in 0..n_chunks_x {
             let base = x_rest * S_SIZE;
@@ -339,7 +347,7 @@ mod tests {
             ntt_v8.forward(&mut z_col);
             let eq_x = eq_full[x_rest];
             for i in 0..LAMBDA4_SIZE {
-                p_z_ref[i] += eq_x * phi8(z_col[S_SIZE + i]);
+                p_z_ref[i] += eq_x.mul_f128(phi8(z_col[S_SIZE + i]));
             }
         }
         for i in 0..LAMBDA4_SIZE {

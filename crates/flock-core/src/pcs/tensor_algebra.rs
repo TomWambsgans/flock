@@ -5,57 +5,65 @@
 //
 // Ported from binius64's `crates/math/src/tensor_algebra.rs`
 // (https://github.com/binius-zk/binius64), specialized to `F = F_2`,
-// `FE = F_{2^128}`.
+// `FE = F_{2^256}`.
 
-//! Tensor algebra over `F_{2^128} ⊗_{F_2} F_{2^128}`.
+//! Tensor algebra over `F_{2^256} ⊗_{F_2} F_{2^256}`.
 //!
-//! An element is a length-128 vector of `F128` (the "vertical-subring" elements
-//! in DP24 nomenclature). Conceptually it's a 128×128 F_2 matrix, where row `i`
-//! is `elems[i]` viewed via its bit-decomposition in the GHASH polynomial
-//! basis (`bit_j(elems[i])` = coefficient of `γ^i ⊗ γ^j` in the tensor algebra).
+//! An element is a length-256 vector of `F256` (the "vertical-subring" elements
+//! in DP24 nomenclature). Conceptually it's a 256×256 F_2 matrix, where row `i`
+//! is `elems[i]` viewed via its bit-decomposition in the natural F256 basis
+//! `{x^a·u^b : a∈[0,128), b∈[0,2)}` (`bit_j(elems[i])` = coefficient of
+//! `δ_i ⊗ δ_j`, with `δ_k` the k-th F256 basis element).
+//!
+//! Bit layout of an `F256` element (matching `pack`'s convention and the
+//! `(c0, c1)` memory order): bit `k` for `k∈[0,256)` is
+//! - `k∈[0,64)`    → `c0.lo` bit `k`
+//! - `k∈[64,128)`  → `c0.hi` bit `k−64`
+//! - `k∈[128,192)` → `c1.lo` bit `k−128`
+//! - `k∈[192,256)` → `c1.hi` bit `k−192`
 //!
 //! Used by the verifier's polylog `eval_rs_eq` (DP24 §1.3, Figure 3).
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 use core::ops::{Add, AddAssign};
 
-/// The degree of `F_{2^128}` over `F_2`.
-pub const DEGREE: usize = 128;
+/// The degree of `F_{2^256}` over `F_2`.
+pub const DEGREE: usize = 256;
 
-/// An element of `F_{2^128} ⊗_{F_2} F_{2^128}`, stored as 128 `F128` elements
+/// An element of `F_{2^256} ⊗_{F_2} F_{2^256}`, stored as 256 `F256` elements
 /// (the vertical-subring decomposition).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorAlgebra {
-    /// Length-128 vector. `elems[i]` is the coefficient of `γ^i` in the
+    /// Length-256 vector. `elems[i]` is the coefficient of `δ_i` in the
     /// vertical basis decomposition.
-    pub elems: Vec<F128>,
+    pub elems: Vec<F256>,
 }
 
 impl TensorAlgebra {
     /// All-zero element.
     pub fn zero() -> Self {
         Self {
-            elems: vec![F128::ZERO; DEGREE],
+            elems: vec![F256::ZERO; DEGREE],
         }
     }
 
     /// Multiplicative identity: `1 ⊗ 1`.
     pub fn one() -> Self {
-        let mut elems = vec![F128::ZERO; DEGREE];
-        elems[0] = F128::ONE;
+        let mut elems = vec![F256::ZERO; DEGREE];
+        elems[0] = F256::ONE;
         Self { elems }
     }
 
-    /// Embed `x ∈ F_{2^128}` into the vertical subring: returns `1 ⊗ x`.
-    pub fn from_vertical(x: F128) -> Self {
-        let mut elems = vec![F128::ZERO; DEGREE];
+    /// Embed `x ∈ F_{2^256}` into the vertical subring: returns `1 ⊗ x`.
+    pub fn from_vertical(x: F256) -> Self {
+        let mut elems = vec![F256::ZERO; DEGREE];
         elems[0] = x;
         Self { elems }
     }
 
     /// Multiply by an element of the vertical subring: each `elems[i]` is
-    /// scaled by `scalar` in `F_{2^128}`.
-    pub fn scale_vertical(mut self, scalar: F128) -> Self {
+    /// scaled by `scalar` in `F_{2^256}`.
+    pub fn scale_vertical(mut self, scalar: F256) -> Self {
         for e in self.elems.iter_mut() {
             *e *= scalar;
         }
@@ -64,30 +72,30 @@ impl TensorAlgebra {
 
     /// Multiply by an element of the horizontal subring. Implemented as
     /// `transpose ∘ scale_vertical ∘ transpose`.
-    pub fn scale_horizontal(self, scalar: F128) -> Self {
+    pub fn scale_horizontal(self, scalar: F256) -> Self {
         self.transpose().scale_vertical(scalar).transpose()
     }
 
     /// Transpose the tensor algebra element: swap vertical and horizontal
     /// subring roles. Concretely, after transpose, `bit_j(elems'[i]) =
-    /// bit_i(elems[j])` for all `i, j ∈ [0, 128)`.
+    /// bit_i(elems[j])` for all `i, j ∈ [0, 256)`.
     pub fn transpose(mut self) -> Self {
         square_transpose(&mut self.elems);
         self
     }
 
-    /// Fold the tensor algebra element to a single `F128` by scaling rows with
-    /// `coeffs` (length 128) and summing.
+    /// Fold the tensor algebra element to a single `F256` by scaling rows with
+    /// `coeffs` (length 256) and summing.
     ///
     /// Computes `Σ_i coeffs[i] · transpose(self).elems[i]`.
-    pub fn fold_vertical(self, coeffs: &[F128]) -> F128 {
+    pub fn fold_vertical(self, coeffs: &[F256]) -> F256 {
         assert_eq!(
             coeffs.len(),
             DEGREE,
-            "fold_vertical: coeffs.len() must be 128"
+            "fold_vertical: coeffs.len() must be 256"
         );
         let transposed = self.transpose();
-        let mut acc = F128::ZERO;
+        let mut acc = F256::ZERO;
         for (e, c) in transposed.elems.iter().zip(coeffs.iter()) {
             acc += *e * *c;
         }
@@ -111,39 +119,50 @@ impl AddAssign<&TensorAlgebra> for TensorAlgebra {
     }
 }
 
-/// In-place 128×128 F_2 matrix transpose of the F128 coefficient table.
+/// Read bit `b ∈ [0, 256)` of an `F256` element (natural `(c0, c1)` layout).
+#[inline]
+fn f256_bit(x: F256, b: usize) -> u64 {
+    let word = match b >> 6 {
+        0 => x.c0.lo,
+        1 => x.c0.hi,
+        2 => x.c1.lo,
+        _ => x.c1.hi,
+    };
+    (word >> (b & 63)) & 1
+}
+
+/// Build an `F256` from its 256 bits given as a per-word accumulator.
+#[inline]
+fn f256_from_words(w0: u64, w1: u64, w2: u64, w3: u64) -> F256 {
+    F256 {
+        c0: F128 { lo: w0, hi: w1 },
+        c1: F128 { lo: w2, hi: w3 },
+    }
+}
+
+/// In-place 256×256 F_2 matrix transpose of the F256 coefficient table.
 ///
-/// On input: `elems[i]` viewed as a 128-bit row; bit `j` is the F_2 coefficient
+/// On input: `elems[i]` viewed as a 256-bit row; bit `j` is the F_2 coefficient
 /// at position `(i, j)`.
 /// On output: bit `j` of `elems[i]` becomes the old bit `i` of `elems[j]`.
 ///
-/// V1 implementation: naive O(D²) bit-scan. Each of 128² output bits is read
+/// V1 implementation: naive O(D²) bit-scan. Each of 256² output bits is read
 /// from exactly one input bit.
-fn square_transpose(elems: &mut [F128]) {
+fn square_transpose(elems: &mut [F256]) {
     assert_eq!(
         elems.len(),
         DEGREE,
-        "square_transpose: input must be length 128"
+        "square_transpose: input must be length 256"
     );
 
-    let mut out = [F128::ZERO; DEGREE];
-    for j in 0..DEGREE {
-        let src_bit = |k: usize| -> u64 {
-            if j < 64 {
-                (elems[k].lo >> j) & 1
-            } else {
-                (elems[k].hi >> (j - 64)) & 1
-            }
-        };
-        let mut lo: u64 = 0;
-        let mut hi: u64 = 0;
-        for i in 0..64 {
-            lo |= src_bit(i) << i;
+    let mut out = vec![F256::ZERO; DEGREE];
+    for (j, slot) in out.iter_mut().enumerate() {
+        // out[j] gathers bit j of every input row: out[j] bit i = elems[i] bit j.
+        let mut w = [0u64; 4];
+        for i in 0..DEGREE {
+            w[i >> 6] |= f256_bit(elems[i], j) << (i & 63);
         }
-        for i in 64..128 {
-            hi |= src_bit(i) << (i - 64);
-        }
-        out[j] = F128 { lo, hi };
+        *slot = f256_from_words(w[0], w[1], w[2], w[3]);
     }
     elems.copy_from_slice(&out);
 }
@@ -170,8 +189,14 @@ mod tests {
                 hi: self.nx(),
             }
         }
+        fn f256(&mut self) -> F256 {
+            F256 {
+                c0: self.f128(),
+                c1: self.f128(),
+            }
+        }
         fn ta(&mut self) -> TensorAlgebra {
-            let elems = (0..DEGREE).map(|_| self.f128()).collect();
+            let elems = (0..DEGREE).map(|_| self.f256()).collect();
             TensorAlgebra { elems }
         }
     }
@@ -192,18 +217,10 @@ mod tests {
         let original = rng.ta();
         let transposed = original.clone().transpose();
 
-        fn bit(x: F128, b: usize) -> u64 {
-            if b < 64 {
-                (x.lo >> b) & 1
-            } else {
-                (x.hi >> (b - 64)) & 1
-            }
-        }
-
         for i in 0..DEGREE {
             for j in 0..DEGREE {
-                let orig_ij = bit(original.elems[i], j);
-                let trans_ji = bit(transposed.elems[j], i);
+                let orig_ij = f256_bit(original.elems[i], j);
+                let trans_ji = f256_bit(transposed.elems[j], i);
                 assert_eq!(orig_ij, trans_ji, "transpose mismatch at (i={i}, j={j})");
             }
         }
@@ -214,8 +231,8 @@ mod tests {
         // from_vertical(x).scale_vertical(y) should equal from_vertical(x*y).
         let mut rng = Rng::new(123);
         for _ in 0..10 {
-            let x = rng.f128();
-            let y = rng.f128();
+            let x = rng.f256();
+            let y = rng.f256();
             let lhs = TensorAlgebra::from_vertical(x).scale_vertical(y);
             let rhs = TensorAlgebra::from_vertical(x * y);
             assert_eq!(lhs, rhs);
@@ -224,12 +241,10 @@ mod tests {
 
     #[test]
     fn scale_horizontal_via_transpose() {
-        // scale_horizontal(s) == transpose.scale_vertical(s).transpose by
-        // construction, but verify the API works end-to-end.
         let mut rng = Rng::new(456);
         for _ in 0..10 {
             let t = rng.ta();
-            let s = rng.f128();
+            let s = rng.f256();
             let via_api = t.clone().scale_horizontal(s);
             let manual = t.transpose().scale_vertical(s).transpose();
             assert_eq!(via_api, manual);
@@ -243,11 +258,7 @@ mod tests {
         let b = rng.ta();
         let sum = a.clone() + &b;
         for i in 0..DEGREE {
-            let expected = F128 {
-                lo: a.elems[i].lo ^ b.elems[i].lo,
-                hi: a.elems[i].hi ^ b.elems[i].hi,
-            };
-            assert_eq!(sum.elems[i], expected);
+            assert_eq!(sum.elems[i], a.elems[i] + b.elems[i]);
         }
     }
 
@@ -263,17 +274,16 @@ mod tests {
     fn one_from_vertical_one() {
         assert_eq!(
             TensorAlgebra::one(),
-            TensorAlgebra::from_vertical(F128::ONE)
+            TensorAlgebra::from_vertical(F256::ONE)
         );
     }
 
     #[test]
     fn scale_vertical_distributes_over_add() {
-        // (a + b) * s == a*s + b*s
         let mut rng = Rng::new(1213);
         let a = rng.ta();
         let b = rng.ta();
-        let s = rng.f128();
+        let s = rng.f256();
         let lhs = (a.clone() + &b).scale_vertical(s);
         let rhs = a.scale_vertical(s) + &b.scale_vertical(s);
         assert_eq!(lhs, rhs);
@@ -283,7 +293,7 @@ mod tests {
     fn fold_vertical_with_zero_coeffs_is_zero() {
         let mut rng = Rng::new(1415);
         let t = rng.ta();
-        let zeros = vec![F128::ZERO; DEGREE];
-        assert_eq!(t.fold_vertical(&zeros), F128::ZERO);
+        let zeros = vec![F256::ZERO; DEGREE];
+        assert_eq!(t.fold_vertical(&zeros), F256::ZERO);
     }
 }

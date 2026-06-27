@@ -1,15 +1,15 @@
 //! Polynomial commitment scheme for the bit-MLE witness `ẑ` over GF(2).
 //!
-//! Construction: Binius-style PCS with F_{2^128} packing.
+//! Construction: Binius-style PCS with F_{2^256} packing.
 //!
-//! - **Commit**: pack the 2^m Boolean witness into 2^(m−7) F_{2^128} elements
-//!   (one bit per polynomial-basis coordinate of F_{2^128}), batch RS-encode
+//! - **Commit**: pack the 2^m Boolean witness into 2^(m−8) F_{2^256} elements
+//!   (one bit per polynomial-basis coordinate of F_{2^256}), batch RS-encode
 //!   via additive NTT, Merkle-commit the codeword.
 //! - **Open**: at a QuirkyPoint (z_skip, x_outer) from the zerocheck/lincheck:
-//!   1. [`ring_switch::prove`] sends 128 partial-evaluations `s_hat_v` and
+//!   1. [`ring_switch::prove`] sends 256 partial-evaluations `s_hat_v` and
 //!      produces a BaseFold target `(rs_eq_ind, sumcheck_claim)`.
 //!   2. [`basefold::prove`] runs the bivariate sumcheck of
-//!      `⟨packed_witness, rs_eq_ind⟩ = sumcheck_claim` over m−7 rounds.
+//!      `⟨packed_witness, rs_eq_ind⟩ = sumcheck_claim` over m−8 rounds.
 //! - **Verify**: the verifier replays both steps. After ring-switching it
 //!   reconstructs `rs_eq_ind` locally and checks the sumcheck's final value,
 //!   then walks the multi-arity FRI codeword folds — verifying per-query
@@ -38,9 +38,39 @@ pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::F256;
 use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
+
+/// Dedicated big-stack, multi-threaded pool for the prover.
+///
+/// Under F256 (32-byte field elements) the prove call chain's stack frames are
+/// ~2× the F128 ones, and the deep zerocheck→lincheck→ring-switch→Ligerito
+/// chain overflows a default thread stack at larger `m`. Running a prove via
+/// `install()` on this pool gives the carrying worker a large stack, while
+/// inner `par_iter`s reached from the prove dispatch back onto this same
+/// (perf-core-sized) pool — preserving parallelism. Mirrors
+/// `verifier::verifier_pool` (single-threaded there; the prover is not).
+///
+/// `pub` so the `flock-prover` entry points can install their whole prove body
+/// here (the deep frames are spread across the chain, not just the recursive
+/// Ligerito prover).
+pub fn prover_stack_pool() -> &'static rayon::ThreadPool {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(crate::perf_core_count_cached())
+            // 256 MiB: the F256 recursion's frames are large (some stack arrays
+            // scale with problem size). Stack is reserved virtually, not
+            // committed, so this is cheap. PERF TODO(f256): move the large
+            // per-level stack buffers to the heap and shrink this back.
+            .stack_size(256 * 1024 * 1024)
+            .thread_name(|i| format!("flock-lig-prove-{i}"))
+            .build()
+            .expect("build ligerito prover pool")
+    })
+}
 
 /// Composite opening proof: ring-switching message + BaseFold proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +123,7 @@ pub enum VerifyError {
 #[derive(Clone, Debug)]
 pub enum DirectEqInd {
     /// Fully-materialized `eq_ind(point)` of length `2^L`.
-    Dense(Vec<F128>),
+    Dense(Vec<F256>),
     /// Sparse representation — non-zero entries at scattered indices.
     /// Built from a claim point with one or more exactly-zero coords via
     /// [`ring_switch::build_eq_sparse`].
@@ -115,10 +145,10 @@ pub enum DirectEqInd {
 /// `γ_k · eq_eval(point, basefold_challenges)`.
 #[derive(Clone, Debug)]
 pub struct PackedDirectClaim {
-    /// Multilinear point of length `L = m − 7`.
-    pub point: Vec<F128>,
+    /// Multilinear point of length `L = m − 8`.
+    pub point: Vec<F256>,
     /// Claimed `ẑ_packed(point)` value.
-    pub value: F128,
+    pub value: F256,
     /// `eq_ind(point)` in dense or sparse form. Caller responsibility to
     /// match the claim's `point` — the contribution to `b_combined` is read
     /// directly from this tensor.
@@ -127,15 +157,15 @@ pub struct PackedDirectClaim {
 
 /// Open the committed witness at a zerocheck-style point `(z_skip, x_outer)`.
 ///
-/// `packed_witness` is the same F_{2^128}-packed witness that was passed to
+/// `packed_witness` is the same F_{2^256}-packed witness that was passed to
 /// [`commit`] — caller must retain its own copy (it is NOT stored in
 /// `ProverData`). `prover_data` is the output of [`commit`]. `x_outer` is the
 /// multilinear portion of the QuirkyPoint with length `m − 6`.
 pub fn open<Ch: Challenger>(
-    packed_witness: &[F128],
+    packed_witness: &[F256],
     prover_data: &ProverData,
     commitment: &Commitment,
-    x_outer: &[F128],
+    x_outer: &[F256],
     challenger: &mut Ch,
 ) -> OpeningProof {
     challenger.observe_label(b"flock-pcs-open-v0");
@@ -165,10 +195,10 @@ pub fn open<Ch: Challenger>(
 ///
 /// At m=29 this roughly halves total open cost vs calling `open` twice.
 pub fn open_batch<Ch: Challenger>(
-    packed_witness: &[F128],
+    packed_witness: &[F256],
     prover_data: &ProverData,
     commitment: &Commitment,
-    x_outers: &[&[F128]],
+    x_outers: &[&[F256]],
     challenger: &mut Ch,
 ) -> BatchOpeningProof {
     open_batch_padded(
@@ -185,10 +215,10 @@ pub fn open_batch<Ch: Challenger>(
 /// ring-switching's `fold_1b_rows` so per-block padding chunks are skipped.
 /// Byte-identical to the dense path on honestly zero-padded witnesses.
 pub fn open_batch_padded<Ch: Challenger>(
-    packed_witness: &[F128],
+    packed_witness: &[F256],
     prover_data: &ProverData,
     commitment: &Commitment,
-    x_outers: &[&[F128]],
+    x_outers: &[&[F256]],
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> BatchOpeningProof {
@@ -207,11 +237,11 @@ pub fn open_batch_padded<Ch: Challenger>(
 /// precomputed `s_hat_v`. See [`open_batch_mixed_with_precomputed_s_hat_v`].
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_padded_with_precomputed_s_hat_v<Ch: Challenger>(
-    packed_witness: &[F128],
+    packed_witness: &[F256],
     prover_data: &ProverData,
     commitment: &Commitment,
-    x_outers: &[&[F128]],
-    precomputed_s_hat_v: &[Option<&[F128]>],
+    x_outers: &[&[F256]],
+    precomputed_s_hat_v: &[Option<&[F256]>],
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> BatchOpeningProof {
@@ -242,10 +272,10 @@ pub fn open_batch_padded_with_precomputed_s_hat_v<Ch: Challenger>(
 /// sample γ's (one per total claim, ring-switched first) → BaseFold.
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_mixed<Ch: Challenger>(
-    packed_witness: &[F128],
+    packed_witness: &[F256],
     prover_data: &ProverData,
     commitment: &Commitment,
-    x_outers: &[&[F128]],
+    x_outers: &[&[F256]],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     challenger: &mut Ch,
@@ -271,11 +301,11 @@ pub fn open_batch_mixed<Ch: Challenger>(
 /// `precomputed_s_hat_v` must be `&[]` or have length `x_outers.len()`.
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_mixed_with_precomputed_s_hat_v<Ch: Challenger>(
-    packed_witness: &[F128],
+    packed_witness: &[F256],
     prover_data: &ProverData,
     commitment: &Commitment,
-    x_outers: &[&[F128]],
-    precomputed_s_hat_v: &[Option<&[F128]>],
+    x_outers: &[&[F256]],
+    precomputed_s_hat_v: &[Option<&[F256]>],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     challenger: &mut Ch,
@@ -342,11 +372,11 @@ pub fn open_batch_mixed_with_precomputed_s_hat_v<Ch: Challenger>(
 /// `prover_data`'s codeword/tree shape matches what Ligerito expects for L0.
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
-    packed_witness: Vec<F128>,
+    packed_witness: Vec<F256>,
     prover_data: &ProverData,
     commitment: &Commitment,
-    x_outers: &[&[F128]],
-    precomputed_s_hat_v: &[Option<&[F128]>],
+    x_outers: &[&[F256]],
+    precomputed_s_hat_v: &[Option<&[F256]>],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     lig_config: &ligerito::ProverConfig,
@@ -377,16 +407,25 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     );
 
     let t = std::time::Instant::now();
-    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
-        lig_config,
-        packed_witness,
-        combined.b_combined,
-        combined.target_combined,
-        &prover_data.codeword,
-        &prover_data.merkle_tree,
-        combined.round0_prime,
-        challenger,
-    );
+    // The recursive Ligerito prover threads a deep level-recursion on the
+    // calling thread; under F256 (32-byte field elements) its stack frames are
+    // ~2× the F128 ones and overflow a default 2–8 MiB thread stack at m ≳ 22.
+    // Run it inside a dedicated big-stack, multi-threaded pool — the worker
+    // carrying the recursion gets 64 MiB, and inner `par_iter`s reached from
+    // here dispatch back onto the same pool, so parallelism is preserved.
+    // (Mirrors the verifier's 64 MiB `verifier_pool`.)
+    let ligerito_proof = prover_stack_pool().install(|| {
+        ligerito::recursive_prover_with_basis_precomputed_round0(
+            lig_config,
+            packed_witness,
+            combined.b_combined,
+            combined.target_combined,
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            combined.round0_prime,
+            challenger,
+        )
+    });
     if trace {
         eprintln!(
             "  [open_batch] ligerito::recursive_prover_with_basis: {:6.2} ms",
@@ -407,10 +446,10 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
 /// What ring_switch + claim-combination produces, fed to either BaseFold or Ligerito.
 struct CombinedClaim {
     ring_switches: Vec<RingSwitchProof>,
-    b_combined: Vec<F128>,
-    target_combined: F128,
+    b_combined: Vec<F256>,
+    target_combined: F256,
     /// BaseFold's round-0 sumcheck `(u_0, u_2)` prime. Ligerito ignores it.
-    round0_prime: (F128, F128),
+    round0_prime: (F256, F256),
 }
 
 /// Shared by both backends: runs ring_switch over RS claims, observes packed-
@@ -420,9 +459,9 @@ struct CombinedClaim {
 /// effect (cheap since it shares the b_combined pass).
 #[allow(clippy::too_many_arguments)]
 fn compute_combined_basis_and_target<Ch: Challenger>(
-    packed_witness: &[F128],
-    x_outers: &[&[F128]],
-    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_witness: &[F256],
+    x_outers: &[&[F256]],
+    precomputed_s_hat_v: &[Option<&[F256]>],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     challenger: &mut Ch,
@@ -443,7 +482,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let t = std::time::Instant::now();
     let (rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
-        Vec<F128>,
+        Vec<F256>,
     ) = if n_rs > 0 {
         ring_switch::prove_batched_padded_with_precomputed(
             packed_witness,
@@ -466,9 +505,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // 2. Observe packed-direct claim values + sample γ_pd.
     for pd in packed_direct {
         challenger.observe_label(b"flock-pcs-packed-direct-v0");
-        challenger.observe_f128(pd.value);
+        challenger.observe_f256(pd.value);
     }
-    let gammas_pd: Vec<F128> = (0..n_pd).map(|_| challenger.sample_f128()).collect();
+    let gammas_pd: Vec<F256> = (0..n_pd).map(|_| challenger.sample_f256()).collect();
 
     let t = std::time::Instant::now();
     use rayon::prelude::*;
@@ -484,7 +523,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         "all packed-direct claims must share L (= packed witness length)"
     );
 
-    let mut target_combined = F128::ZERO;
+    let mut target_combined = F256::ZERO;
     for ((_, output), g) in rs_results.iter().zip(gammas_rs.iter()) {
         target_combined += *g * output.sumcheck_claim;
     }
@@ -492,7 +531,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         target_combined += *g * pd.value;
     }
 
-    let rs_baked: Vec<&[F128]> = rs_results
+    let rs_baked: Vec<&[F256]> = rs_results
         .iter()
         .filter_map(|(_, o)| match &o.rs_eq_ind {
             ring_switch::RsEqInd::Dense(v) => Some(v.as_slice()),
@@ -503,7 +542,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // was never materialized — fold each slot on the fly below and accumulate
     // straight into `b_combined`, saving a 2^(m-7) materialize + readback per
     // claim. Carries (eq_lo, eq_hi, γ-baked table, log₂ B).
-    let rs_deferred: Vec<(&[F128], &[F128], &[F128], usize)> = rs_results
+    let rs_deferred: Vec<(&[F256], &[F256], &[F256], usize)> = rs_results
         .iter()
         .filter_map(|(_, o)| match &o.rs_eq_ind {
             ring_switch::RsEqInd::DeferredDense {
@@ -519,7 +558,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             _ => None,
         })
         .collect();
-    let pd_dense: Vec<(&[F128], F128)> = packed_direct
+    let pd_dense: Vec<(&[F256], F256)> = packed_direct
         .iter()
         .zip(gammas_pd.iter())
         .filter_map(|(pd, g)| match &pd.eq_ind {
@@ -530,7 +569,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      BaseFold round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
+    let mut b_combined: Vec<F256> = crate::scratch::take_f256(l);
 
     // Fast path (compression-proof open: claims ab, c): every RS claim is a
     // fused DeferredDense fold and there are no packed-direct claims. Fold all
@@ -567,8 +606,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 }
                 // Round-0 prime over this block's pairs (b is even, base is even).
                 let base = hi * b;
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
+                let mut u0 = F256::ZERO;
+                let mut u2 = F256::ZERO;
                 for t in 0..(b / 2) {
                     let s0 = out_block[2 * t];
                     let s1 = out_block[2 * t + 1];
@@ -580,7 +619,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 (u0, u2)
             })
             .reduce(
-                || (F128::ZERO, F128::ZERO),
+                || (F256::ZERO, F256::ZERO),
                 |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
             )
     } else {
@@ -588,7 +627,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         // deferred-dense claims (parallel block fold), then the per-element
         // combine over all dense buffers + packed-direct, matching the
         // original behavior.
-        let materialized: Vec<Vec<F128>> = rs_results
+        let materialized: Vec<Vec<F256>> = rs_results
             .iter()
             .filter_map(|(_, o)| match &o.rs_eq_ind {
                 ring_switch::RsEqInd::DeferredDense {
@@ -599,14 +638,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 _ => None,
             })
             .collect();
-        let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
+        let mut rs_dense_all: Vec<&[F256]> = rs_baked.clone();
         rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
         let prime = b_combined
             .par_chunks_mut(2)
             .enumerate()
             .map(|(i, chunk)| {
-                let mut b0 = F128::ZERO;
-                let mut b1 = F128::ZERO;
+                let mut b0 = F256::ZERO;
+                let mut b1 = F256::ZERO;
                 for v in rs_dense_all.iter() {
                     b0 += v[2 * i];
                     b1 += v[2 * i + 1];
@@ -622,15 +661,15 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 (a0 * b0, (a0 + a1) * (b0 + b1))
             })
             .reduce(
-                || (F128::ZERO, F128::ZERO),
+                || (F256::ZERO, F256::ZERO),
                 |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
             );
         for v in materialized {
-            crate::scratch::give_f128(v);
+            crate::scratch::give_f256(v);
         }
         prime
     };
-    let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
+    let mut adjust_prime_for_delta = |idx: usize, delta: F256| {
         let pair = idx / 2;
         let a0 = packed_witness[2 * pair];
         let a1 = packed_witness[2 * pair + 1];
@@ -659,7 +698,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     (a0 * chunk[0], (a0 + a1) * (chunk[0] + chunk[1]))
                 })
                 .reduce(
-                    || (F128::ZERO, F128::ZERO),
+                    || (F256::ZERO, F256::ZERO),
                     |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
                 );
             round0_u0 = u0_fix;
@@ -680,9 +719,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         ring_switches: rs_results
             .into_iter()
             .map(|(p, o)| {
-                // The per-claim rs_eq_ind (L F128s) dies here — recycle it.
+                // The per-claim rs_eq_ind (L F256s) dies here — recycle it.
                 if let ring_switch::RsEqInd::Dense(v) = o.rs_eq_ind {
-                    crate::scratch::give_f128(v);
+                    crate::scratch::give_f256(v);
                 }
                 p
             })
@@ -700,7 +739,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 /// range of `b_combined`. Splits `b_combined` at the chunk boundaries via
 /// `split_at_mut`, then writes scatter-adds into the disjoint mutable slices —
 /// safe rust, no atomics.
-fn sparse_scatter_add_parallel(b_combined: &mut [F128], eq: &SparseEqTensor, gamma: F128) {
+fn sparse_scatter_add_parallel(b_combined: &mut [F256], eq: &SparseEqTensor, gamma: F256) {
     use rayon::prelude::*;
 
     let c_total = eq.live_tensor.len();
@@ -730,8 +769,8 @@ fn sparse_scatter_add_parallel(b_combined: &mut [F128], eq: &SparseEqTensor, gam
     debug_assert!(b_boundaries.windows(2).all(|w| w[0] <= w[1]));
 
     // Disjoint mutable slices via repeated split_at_mut.
-    let mut remaining: &mut [F128] = b_combined;
-    let mut slices: Vec<&mut [F128]> = Vec::with_capacity(actual_n_chunks);
+    let mut remaining: &mut [F256] = b_combined;
+    let mut slices: Vec<&mut [F256]> = Vec::with_capacity(actual_n_chunks);
     for i in 1..actual_n_chunks {
         let split_at = b_boundaries[i] - b_boundaries[i - 1];
         let (left, right) = remaining.split_at_mut(split_at);
@@ -759,9 +798,9 @@ fn sparse_scatter_add_parallel(b_combined: &mut [F128], eq: &SparseEqTensor, gam
 /// single BaseFold proof.
 pub fn verify_opening_batch<Ch: Challenger>(
     commitment: &Commitment,
-    claims: &[F128],
-    z_skips: &[F128],
-    x_outers: &[&[F128]],
+    claims: &[F256],
+    z_skips: &[F256],
+    x_outers: &[&[F256]],
     proof: &BatchOpeningProof,
     challenger: &mut Ch,
 ) -> Result<(), VerifyError> {
@@ -782,17 +821,17 @@ pub fn verify_opening_batch<Ch: Challenger>(
 /// the chain shift sumcheck output).
 #[derive(Clone, Copy, Debug)]
 pub struct PackedDirectClaimRef<'a> {
-    pub point: &'a [F128],
-    pub value: F128,
+    pub point: &'a [F256],
+    pub value: F256,
 }
 
 /// Verify a mixed-claim batched opening. Mirror of [`open_batch_mixed`].
 #[allow(clippy::too_many_arguments)]
 pub fn verify_opening_batch_mixed<Ch: Challenger>(
     commitment: &Commitment,
-    claims: &[F128],
-    z_skips: &[F128],
-    x_outers: &[&[F128]],
+    claims: &[F256],
+    z_skips: &[F256],
+    x_outers: &[&[F256]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     proof: &BatchOpeningProof,
     challenger: &mut Ch,
@@ -836,7 +875,7 @@ pub fn verify_opening_batch_mixed<Ch: Challenger>(
         .map_err(VerifyError::RingSwitch)?;
         rs_outputs.push(out);
     }
-    let gammas_rs: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
+    let gammas_rs: Vec<F256> = (0..n_rs).map(|_| challenger.sample_f256()).collect();
     if trace {
         eprintln!(
             "      [pcsv] ring_switch::verify_succinct ×{}: {}",
@@ -849,12 +888,12 @@ pub fn verify_opening_batch_mixed<Ch: Challenger>(
     //    Zippel-sound: γ_pd[k] is sampled after pd.value[k] is observed).
     for pd in packed_direct {
         challenger.observe_label(b"flock-pcs-packed-direct-v0");
-        challenger.observe_f128(pd.value);
+        challenger.observe_f256(pd.value);
     }
-    let gammas_pd: Vec<F128> = (0..n_pd).map(|_| challenger.sample_f128()).collect();
+    let gammas_pd: Vec<F256> = (0..n_pd).map(|_| challenger.sample_f256()).collect();
 
     // 4. Combined target: γ_rs · sumcheck_claim_rs + γ_pd · value_pd.
-    let mut target_combined = F128::ZERO;
+    let mut target_combined = F256::ZERO;
     for (out, g) in rs_outputs.iter().zip(gammas_rs.iter()) {
         target_combined += *g * out.sumcheck_claim;
     }
@@ -893,10 +932,10 @@ pub fn verify_opening_batch_mixed<Ch: Challenger>(
     //    eq_eval(point, challenges). Ring-switched uses the DP24 succinct
     //    recurrence; packed-direct uses the standard multilinear eq evaluation.
     let t = std::time::Instant::now();
-    let mut expected_final_b = F128::ZERO;
+    let mut expected_final_b = F256::ZERO;
     for (out, (g, x_outer)) in rs_outputs.iter().zip(gammas_rs.iter().zip(x_outers.iter())) {
         expected_final_b +=
-            *g * ring_switch::eval_rs_eq(&x_outer[1..], &challenges, &out.eq_r_dprime);
+            *g * ring_switch::eval_rs_eq(&x_outer[2..], &challenges, &out.eq_r_dprime);
     }
     // Packed-direct: γ_pd · eq_eval(point, basefold_challenges). The basefold
     // challenges have length L = m − 7, matching the packed-direct point.
@@ -930,9 +969,9 @@ pub fn verify_opening_batch_mixed<Ch: Challenger>(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     commitment: &Commitment,
-    claims: &[F128],
-    z_skips: &[F128],
-    x_outers: &[&[F128]],
+    claims: &[F256],
+    z_skips: &[F256],
+    x_outers: &[&[F256]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     proof: &BatchOpeningProofLigerito,
     lig_config: &ligerito::VerifierConfig,
@@ -962,17 +1001,17 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
         .map_err(VerifyError::RingSwitch)?;
         rs_outputs.push(out);
     }
-    let gammas_rs: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
+    let gammas_rs: Vec<F256> = (0..n_rs).map(|_| challenger.sample_f256()).collect();
 
     // 2. PD claim values + γ_pd.
     for pd in packed_direct {
         challenger.observe_label(b"flock-pcs-packed-direct-v0");
-        challenger.observe_f128(pd.value);
+        challenger.observe_f256(pd.value);
     }
-    let gammas_pd: Vec<F128> = (0..n_pd).map(|_| challenger.sample_f128()).collect();
+    let gammas_pd: Vec<F256> = (0..n_pd).map(|_| challenger.sample_f256()).collect();
 
     // 3. target_combined from succinct rs claims + PD values.
-    let mut target_combined = F128::ZERO;
+    let mut target_combined = F256::ZERO;
     for (out, g) in rs_outputs.iter().zip(gammas_rs.iter()) {
         target_combined += *g * out.sumcheck_claim;
     }
@@ -986,7 +1025,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     //    For PD claims, precompute eq prefix factors over ris and finish per y.
     //    For BLAKE3 m=30: ris is 19 dims, yr is 4 dims → 19× prefix reuse.
     let log_n = commitment.params.m - LOG_PACKING;
-    let eval_b_residual = |ris: &[F128], yr_log_n: usize| -> Vec<F128> {
+    let eval_b_residual = |ris: &[F256], yr_log_n: usize| -> Vec<F256> {
         use crate::zerocheck::multilinear::eq_eval;
         let yr_len = 1usize << yr_log_n;
         let prefix_len = ris.len();
@@ -996,14 +1035,14 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
             .iter()
             .zip(x_outers.iter())
             .map(|(_out, x_outer)| {
-                // x_outer[1..] has length log_n; we feed only the ris prefix.
-                ring_switch::eval_rs_eq_prefix(&x_outer[1..1 + prefix_len], ris)
+                // x_outer[2..] has length log_n; we feed only the ris prefix.
+                ring_switch::eval_rs_eq_prefix(&x_outer[2..2 + prefix_len], ris)
             })
             .collect();
 
         // ---- PD claim prefix scalars ----
         // eq(pd.point, point) factors over coordinates; precompute the prefix product.
-        let pd_prefix_scalars: Vec<F128> = packed_direct
+        let pd_prefix_scalars: Vec<F256> = packed_direct
             .iter()
             .map(|pd| eq_eval(&pd.point[..prefix_len], ris))
             .collect();
@@ -1018,7 +1057,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
             .into_par_iter()
             .map(|y| {
                 let y_bits = y as u32;
-                let mut sum = F128::ZERO;
+                let mut sum = F256::ZERO;
                 for (((out, g), x_outer), prefix) in rs_outputs
                     .iter()
                     .zip(gammas_rs.iter())
@@ -1028,7 +1067,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
                     sum += *g
                         * ring_switch::eval_rs_eq_finish_from_prefix_binary_q(
                             prefix,
-                            &x_outer[1 + prefix_len..],
+                            &x_outer[2 + prefix_len..],
                             y_bits,
                             &out.eq_r_dprime,
                         );
@@ -1072,9 +1111,9 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
 /// Verify an opening proof against the commitment. Returns `Ok(())` iff valid.
 pub fn verify_opening<Ch: Challenger>(
     commitment: &Commitment,
-    claim: F128,
-    z_skip: F128,
-    x_outer: &[F128],
+    claim: F256,
+    z_skip: F256,
+    x_outer: &[F256],
     proof: &OpeningProof,
     challenger: &mut Ch,
 ) -> Result<(), VerifyError> {
@@ -1103,7 +1142,7 @@ pub fn verify_opening<Ch: Challenger>(
     // Computed succinctly via the DP24 tensor-algebra recurrence (polylog in
     // witness size), instead of materializing rs_eq_ind densely.
     let expected_final_b =
-        ring_switch::eval_rs_eq(&x_outer[1..], &challenges, &rs_output.eq_r_dprime);
+        ring_switch::eval_rs_eq(&x_outer[2..], &challenges, &rs_output.eq_r_dprime);
     if expected_final_b != proof.basefold.final_b {
         return Err(VerifyError::FinalBMismatch);
     }
@@ -1115,6 +1154,7 @@ pub fn verify_opening<Ch: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+    use crate::field::F128;
     use crate::zerocheck::multilinear::lagrange_weights_naive;
     use crate::zerocheck::univariate_skip::build_eq;
 
@@ -1139,6 +1179,12 @@ mod tests {
                 hi: self.next_u64(),
             }
         }
+        fn f256(&mut self) -> F256 {
+            F256 {
+                c0: self.f128(),
+                c1: self.f128(),
+            }
+        }
     }
 
     fn default_params(m: usize) -> PcsParams {
@@ -1150,15 +1196,15 @@ mod tests {
         }
     }
 
-    fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F128, x_outer: &[F128]) -> F128 {
+    fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F256, x_outer: &[F256]) -> F256 {
         const K_SKIP: usize = 6;
         let ell = 1usize << K_SKIP;
         let lambda = lagrange_weights_naive(K_SKIP, z_skip);
         let eq_outer = build_eq(x_outer);
-        let mut acc = F128::ZERO;
+        let mut acc = F256::ZERO;
         for i_outer in 0..(1usize << (m - K_SKIP)) {
             let base = i_outer * ell;
-            let mut inner = F128::ZERO;
+            let mut inner = F256::ZERO;
             for i_skip in 0..ell {
                 if z[base + i_skip] {
                     inner += lambda[i_skip];
@@ -1173,10 +1219,10 @@ mod tests {
     #[test]
     fn pcs_open_verify_roundtrip() {
         let mut rng = Rng::new(0xC0FFEE_42);
-        for &m in &[8usize, 9, 10, 11] {
+        for &m in &[9usize, 10, 11, 12] {
             let z = rng.bits(1 << m);
-            let z_skip = rng.f128();
-            let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+            let z_skip = rng.f256();
+            let x_outer: Vec<F256> = (0..(m - 6)).map(|_| rng.f256()).collect();
             let claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
 
             let params = default_params(m);
@@ -1197,10 +1243,10 @@ mod tests {
         let m = 10;
         let mut rng = Rng::new(0x99);
         let z = rng.bits(1 << m);
-        let z_skip = rng.f128();
-        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let z_skip = rng.f256();
+        let x_outer: Vec<F256> = (0..(m - 6)).map(|_| rng.f256()).collect();
         let mut claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
-        claim.lo ^= 1;
+        claim.c0.lo ^= 1;
 
         let params = default_params(m);
         let z_packed = pack_witness(&z, m);
@@ -1219,8 +1265,8 @@ mod tests {
         let m = 10;
         let mut rng = Rng::new(0xABCD);
         let z = rng.bits(1 << m);
-        let z_skip = rng.f128();
-        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let z_skip = rng.f256();
+        let x_outer: Vec<F256> = (0..(m - 6)).map(|_| rng.f256()).collect();
         let claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
 
         let params = default_params(m);
@@ -1230,7 +1276,7 @@ mod tests {
         let mut ch_p = FsChallenger::new(b"flock-test-v0");
         let mut proof = open(&z_packed, &prover_data, &commitment, &x_outer, &mut ch_p);
         // Mutate final_a: now caught by either sumcheck or FRI consistency.
-        proof.basefold.final_a.lo ^= 1;
+        proof.basefold.final_a.c0.lo ^= 1;
 
         let mut ch_v = FsChallenger::new(b"flock-test-v0");
         let res = verify_opening(&commitment, claim, z_skip, &x_outer, &proof, &mut ch_v);
@@ -1246,8 +1292,8 @@ mod tests {
         let m = 10;
         let mut rng = Rng::new(0x5EC0_1234);
         let z = rng.bits(1 << m);
-        let z_skip = rng.f128();
-        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let z_skip = rng.f256();
+        let x_outer: Vec<F256> = (0..(m - 6)).map(|_| rng.f256()).collect();
         let claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
 
         let params = default_params(m);
@@ -1283,11 +1329,11 @@ mod tests {
     /// Direct multilinear evaluation of `ẑ_packed` (the F_{2^128}-packed
     /// witness) at a length-L point. Reference computation for the
     /// packed-direct claim path.
-    fn zhat_packed_reference(z_packed: &[F128], point: &[F128]) -> F128 {
+    fn zhat_packed_reference(z_packed: &[F256], point: &[F256]) -> F256 {
         let l = point.len();
         assert_eq!(z_packed.len(), 1usize << l);
         let eq = build_eq(point);
-        let mut acc = F128::ZERO;
+        let mut acc = F256::ZERO;
         for i in 0..z_packed.len() {
             acc += eq[i] * z_packed[i];
         }
@@ -1299,12 +1345,12 @@ mod tests {
     #[test]
     fn pcs_packed_direct_dense_roundtrip() {
         let mut rng = Rng::new(0xDEAD_BEEF);
-        for &m in &[8usize, 10, 11] {
-            let l = m - LOG_PACKING; // = m - 7
+        for &m in &[9usize, 10, 11] {
+            let l = m - LOG_PACKING; // = m - 8
             let z = rng.bits(1 << m);
             let z_packed = pack_witness(&z, m);
 
-            let point: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+            let point: Vec<F256> = (0..l).map(|_| rng.f256()).collect();
             let value = zhat_packed_reference(&z_packed, &point);
             let eq = build_eq(&point);
 
@@ -1346,7 +1392,7 @@ mod tests {
 
             // Wrong claim is rejected.
             let mut bad_value = value;
-            bad_value.lo ^= 1;
+            bad_value.c0.lo ^= 1;
             let pd_bad = PackedDirectClaimRef {
                 point: &point,
                 value: bad_value,
@@ -1372,15 +1418,15 @@ mod tests {
     #[test]
     fn pcs_packed_direct_sparse_roundtrip() {
         let mut rng = Rng::new(0xFACE_F00D);
-        for &m in &[10usize, 11] {
+        for &m in &[11usize, 12] {
             let l = m - LOG_PACKING;
             let z = rng.bits(1 << m);
             let z_packed = pack_witness(&z, m);
 
             // Build a point with the last 2 coords zero (sparse pattern).
-            let mut point: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+            let mut point: Vec<F256> = (0..l).map(|_| rng.f256()).collect();
             for slot in point.iter_mut().rev().take(2) {
-                *slot = F128::ZERO;
+                *slot = F256::ZERO;
             }
             let value = zhat_packed_reference(&z_packed, &point);
             let sparse_eq = ring_switch::build_eq_sparse(&point);
@@ -1434,12 +1480,12 @@ mod tests {
         let z_packed = pack_witness(&z, m);
 
         // Ring-switched claim.
-        let z_skip = rng.f128();
-        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let z_skip = rng.f256();
+        let x_outer: Vec<F256> = (0..(m - 6)).map(|_| rng.f256()).collect();
         let rs_claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
 
         // Packed-direct claim.
-        let pd_point: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+        let pd_point: Vec<F256> = (0..l).map(|_| rng.f256()).collect();
         let pd_value = zhat_packed_reference(&z_packed, &pd_point);
         let pd_eq = build_eq(&pd_point);
         let pd_claim = PackedDirectClaim {
@@ -1488,8 +1534,8 @@ mod tests {
         let m = 22usize;
         let mut rng = Rng::new(0x11_6E_2170);
         let z = rng.bits(1 << m);
-        let z_skip = rng.f128();
-        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let z_skip = rng.f256();
+        let x_outer: Vec<F256> = (0..(m - 6)).map(|_| rng.f256()).collect();
         let rs_claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
 
         // PcsParams MUST set log_batch_size = ligerito_initial_k for L0 reuse.

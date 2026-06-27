@@ -1,7 +1,7 @@
 //! Round-1 URM benchmark for the **degree-4** zerocheck.
 //!
 //! Compares:
-//!   1. `round1_deg4_naive`             — reference, F128 throughout.
+//!   1. `round1_deg4_naive`             — reference, F256 throughout.
 //!   2. `round1_shift_reduce_extract_z_packed_deg4` — scalar optimized.
 //!
 //! Optimized variant uses direct `AdditiveNttGf8` calls per row (no lookup
@@ -14,7 +14,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::ntt::InvNttTableSToV8Gf8;
 use flock_prover::zerocheck::univariate_skip::pack_bits;
 use flock_prover::zerocheck::univariate_skip_deg4::round1_deg4_naive;
@@ -41,26 +41,32 @@ impl Rng {
     fn bits(&mut self, n: usize) -> Vec<bool> {
         (0..n).map(|_| self.next_u64() & 1 == 1).collect()
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
 
-fn build_protocol_r(m: usize, rng: &mut Rng) -> Vec<F128> {
-    let mut r = vec![F128::ZERO; m];
+fn build_protocol_r(m: usize, rng: &mut Rng) -> Vec<F256> {
+    let mut r = vec![F256::ZERO; m];
     for i in 0..K_SKIP {
         r[i] = rng.f128();
     }
     let small = small_challenges_deg4();
     for i in 0..3 {
-        r[K_SKIP + i] = small[i];
+        r[K_SKIP + i] = F256::from_f128(small[i]);
     }
     let med = medium_challenges_deg4();
     for i in 0..4 {
-        r[K_SKIP + 3 + i] = med[i];
+        r[K_SKIP + 3 + i] = F256::from_f128(med[i]);
     }
     for i in (K_SKIP + N_INNER)..m {
         r[i] = rng.f128();
@@ -137,7 +143,7 @@ fn main() {
             let (ab, zz) = (a.clone(), z.clone());
             let cc = c.clone();
             let dd = d.clone();
-            let _t = time_ms("naive (round1_deg4_naive, F128)", 1, || {
+            let _t = time_ms("naive (round1_deg4_naive, F256)", 1, || {
                 round1_deg4_naive(
                     black_box(&ab),
                     black_box(&b),
@@ -149,7 +155,7 @@ fn main() {
                 )
             });
             let (p_abcd, p_z) = round1_deg4_naive(&a, &b, &c, &d, &z, m, &r);
-            naive_checksum = p_abcd[0].lo ^ p_z[0].lo;
+            naive_checksum = p_abcd[0].c0.lo ^ p_z[0].c0.lo;
         }
 
         // ----- optimized (scalar, single-thread) — best-of-3 at every size -----
@@ -170,7 +176,7 @@ fn main() {
         let (opt_abcd, opt_z) = round1_shift_reduce_extract_z_packed_deg4(
             &a_p, &b_p, &c_p, &d_p, &z_p, m, &r, &ntts, &table,
         );
-        let opt_checksum = opt_abcd[0].lo ^ opt_z[0].lo;
+        let opt_checksum = opt_abcd[0].c0.lo ^ opt_z[0].c0.lo;
 
         if naive_checksum != 0 {
             println!("  checksums: naive={naive_checksum:016x}  optimized={opt_checksum:016x}");

@@ -12,11 +12,11 @@
 //!
 //! - **T₁ (initial)** — built in [`super::commit::commit`] before basefold
 //!   runs. Leaves contain ONE codeword position's row-batch lanes
-//!   (`2^log_batch_size = num_ntts` F_{2^128} per leaf). Small leaves keep
+//!   (`2^log_batch_size = num_ntts` F_{2^256} per leaf). Small leaves keep
 //!   per-query path proofs short and proof size low.
 //! - **T₂ (post-row-batch)** — built **inside** [`prove`] right after the
 //!   `log_batch_size` row-batch sumcheck rounds. Multi-arity leaves of
-//!   `2^arity_0` F_{2^128} group consecutive post-row-batch positions so
+//!   `2^arity_0` F_{2^256} group consecutive post-row-batch positions so
 //!   one Merkle opening suffices for the first FRI epoch's `arity_0` folds.
 //!
 //! Subsequent FRI epochs get their own commits via the multi-arity scheme:
@@ -26,17 +26,17 @@
 //! ## Per-query work
 //!
 //! For each FRI query position:
-//! 1. Open the **T₁ leaf** (`num_ntts` F_{2^128} = one position's row-batch
+//! 1. Open the **T₁ leaf** (`num_ntts` F_{2^256} = one position's row-batch
 //!    lanes) via one Merkle path. Verify against T₁ root.
-//! 2. Row-batch-fold the lanes → a single post-row-batch F_{2^128} value.
-//! 3. Open the **T₂ leaf** (`2^arity_0` F_{2^128} = the multi-arity coset
+//! 2. Row-batch-fold the lanes → a single post-row-batch F_{2^256} value.
+//! 3. Open the **T₂ leaf** (`2^arity_0` F_{2^256} = the multi-arity coset
 //!    for this position's FRI epoch 0) via one Merkle path. Verify against
 //!    T₂ root, then **cross-check** that T₂'s value at the queried offset
 //!    matches the row-batch-folded value from step 2.
 //! 4. FRI-fold T₂'s `2^arity_0` values via arity_0 challenges → one value at
 //!    the post-epoch-0 layer.
 //! 5. For each subsequent FRI commit i: open the **epoch leaf**
-//!    (`2^arity_{i+1}` F_{2^128} values), verify Merkle, locate the position
+//!    (`2^arity_{i+1}` F_{2^256} values), verify Merkle, locate the position
 //!    inside the leaf, check it matches the prior epoch's folded value, then
 //!    fold the leaf via arity_{i+1} challenges to produce the next layer's
 //!    expected value.
@@ -58,14 +58,14 @@
 //! prover-side, ~4× smaller proofs.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::merkle::{self, Hash};
 use crate::ntt::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
-/// Default FRI query count at **rate 1/2** (= `log_inv_rate = 1`). 243
-/// queries give 100 bits of provable soundness in the **unique-decoding
-/// regime** (UDR). See [`default_fri_queries`] for the rate-aware lookup
+/// Default FRI query count at **rate 1/2** (= `log_inv_rate = 1`). 311
+/// queries give 128 bits of provable soundness over F256 in the
+/// **unique-decoding regime** (UDR). See [`default_fri_queries`] for the rate-aware lookup
 /// used by [`super::open`] / [`super::open_batch_padded`].
 ///
 /// Within distance `γ = (1−ρ)/2 − ε*` of the RS code (strictly inside the
@@ -78,19 +78,25 @@ use serde::{Deserialize, Serialize};
 /// soundness error ≤ (1 − γ)^t
 /// ```
 ///
-/// For 100 bits we need
+/// For 128 bits we need
 ///
 /// ```text
-/// t · (−log₂(1 − γ)) ≥ 100.
+/// t · (−log₂(1 − γ)) ≥ 128.
 /// ```
 ///
-/// The fold-consistency (proximity-gap) term is `a ≤ 2/ε*` by Theorem 1.4,
-/// independent of codeword length, so over F128 it sits ≥ 115 bits below the
-/// challenge space and needs no grinding. Matches ligerito's `udr_queries` /
-/// `UDR_PROXIMITY_LOSS` derivation.
-pub const DEFAULT_FRI_QUERIES: usize = 243;
+/// The fold-consistency (proximity-gap) term is the unique-decoding radius
+/// `a = γ·n + 1`, independent of codeword length, so over F256 it sits ≥ ~200
+/// bits below the challenge space and needs no grinding. Matches ligerito's
+/// `udr_queries` / `UDR_PROXIMITY_LOSS = 0` derivation.
+///
+/// rate 1/2 at the maximal UD radius (ε* = 0): γ ≈ 0.249 ⇒ −log₂(1−γ) ≈ 0.415
+/// b/q ⇒ ⌈128/0.415⌉ = 309. We use **311** to keep `t·(−log₂(1−γ)) ≥ 128`
+/// even under the stricter ε* = 10⁻³ reading (γ ≈ 0.41277 b/q ⇒ 311·0.41277 =
+/// 128.4 ≥ 128) — a conservative +1/+2 so the 128-bit bound holds under either
+/// convention. (Was 243 for the 100-bit target at 2^128.)
+pub const DEFAULT_FRI_QUERIES: usize = 311;
 
-/// FRI query count required for 100 bits of soundness at the given
+/// FRI query count required for 128 bits of soundness at the given
 /// `log_inv_rate`, in the unique-decoding regime documented on
 /// [`DEFAULT_FRI_QUERIES`]. Slimmer codes (larger `log_inv_rate`) have
 /// larger γ, so each query closes more soundness — but per-query soundness
@@ -101,8 +107,8 @@ pub const DEFAULT_FRI_QUERIES: usize = 243;
 /// updating the table.
 pub fn default_fri_queries(log_inv_rate: usize) -> usize {
     match log_inv_rate {
-        1 => DEFAULT_FRI_QUERIES, // rate 1/2: γ ≈ 0.249, ~0.413 bits/query
-        2 => 148,                 // rate 1/4: γ ≈ 0.374, ~0.676 bits/query
+        1 => DEFAULT_FRI_QUERIES, // rate 1/2: γ ≈ 0.249, ~0.415 b/q ⇒ 311 (≥128 incl. ε* margin)
+        2 => 190,                 // rate 1/4: γ ≈ 0.374, ~0.678 b/q ⇒ 190·0.678 = 128.8 ≥ 128
         _ => panic!(
             "default_fri_queries: unsupported log_inv_rate {log_inv_rate} \
              — add a soundness-derived entry to the table"
@@ -114,8 +120,8 @@ pub fn default_fri_queries(log_inv_rate: usize) -> usize {
 /// derived by the verifier from the running claim: `u_1 = T_r + u_2`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundMessage {
-    pub u_0: F128,
-    pub u_2: F128,
+    pub u_0: F256,
+    pub u_2: F256,
 }
 
 /// Per-epoch FRI commitment: root of the folded codeword's Merkle tree.
@@ -132,21 +138,21 @@ pub struct RoundCommitment {
 pub struct QueryOpening {
     /// Random initial codeword position in `[0, 2^k_code)`.
     pub position: usize,
-    /// Initial Merkle leaf: `2^log_batch_size = num_ntts` F_{2^128} values
+    /// Initial Merkle leaf: `2^log_batch_size = num_ntts` F_{2^256} values
     /// — the row-batch lanes for ONE codeword position. Verifier row-batch-
     /// folds these (using `log_batch_size` sumcheck challenges) down to a
-    /// single F_{2^128} value, then cross-checks against `post_row_batch_leaf`.
-    pub initial_leaf: Vec<F128>,
-    /// Multi-arity post-row-batch leaf: `2^arity_0` F_{2^128} values covering
+    /// single F_{2^256} value, then cross-checks against `post_row_batch_leaf`.
+    pub initial_leaf: Vec<F256>,
+    /// Multi-arity post-row-batch leaf: `2^arity_0` F_{2^256} values covering
     /// `2^arity_0` consecutive post-row-batch codeword positions (including
     /// the queried one). Enables the verifier to do `arity_0` consecutive
     /// FRI folds with a single Merkle opening.
-    pub post_row_batch_leaf: Vec<F128>,
+    pub post_row_batch_leaf: Vec<F256>,
     /// One entry per FRI commit (= `arities.len() − 1` entries; last epoch
     /// sends `final_codeword` in plaintext). Entry `i` is the coset of
-    /// `2^arities[i+1]` F_{2^128} values committed at the end of epoch `i`,
+    /// `2^arities[i+1]` F_{2^256} values committed at the end of epoch `i`,
     /// which is the input to epoch `i+1`'s arity_{i+1} folds.
-    pub epoch_leaves: Vec<Vec<F128>>,
+    pub epoch_leaves: Vec<Vec<F256>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,16 +162,16 @@ pub struct BaseFoldProof {
     /// Commitment to the **post-row-batch** codeword (= initial codeword after
     /// `log_batch_size` row-batch sumcheck folds). Inserted into the transcript
     /// right after the row-batch rounds and before the first FRI round. Multi-
-    /// arity leaves of size `2^arity_0` F_{2^128} support the first FRI epoch
+    /// arity leaves of size `2^arity_0` F_{2^256} support the first FRI epoch
     /// with one Merkle opening per query.
     pub post_row_batch_commit: RoundCommitment,
     /// FRI epoch commitments, length `arities.len() − 1` (last epoch
     /// plaintext).
     pub round_commitments: Vec<RoundCommitment>,
-    pub final_a: F128,
-    pub final_b: F128,
+    pub final_a: F256,
+    pub final_b: F256,
     /// Final codeword (length `2^log_inv_rate`, must be constant).
-    pub final_codeword: Vec<F128>,
+    pub final_codeword: Vec<F256>,
     pub queries: Vec<QueryOpening>,
     /// Octopus multi-proof for the T1 (initial) tree: shared sibling hashes
     /// covering every `queries[*].initial_leaf` against `initial_codeword_root`.
@@ -194,9 +200,13 @@ pub enum VerifyError {
 ///   v += u; u += v · twiddle
 ///   result = u + r · (u + v)
 /// ```
-fn fold_pair(twiddle: F128, u_in: F128, v_in: F128, r: F128) -> F128 {
+///
+/// Genuine F256 arithmetic: the fold challenge `r` mixes the c0/c1 planes of
+/// the codeword values (`r · (u + v)` is a full F256 multiply). The NTT
+/// `twiddle` stays in the base field F128 and multiplies via `mul_f128`.
+fn fold_pair(twiddle: F128, u_in: F256, v_in: F256, r: F256) -> F256 {
     let v = v_in + u_in;
-    let u = u_in + v * twiddle;
+    let u = u_in + v.mul_f128(twiddle);
     u + r * (u + v)
 }
 
@@ -210,7 +220,7 @@ fn fold_pair(twiddle: F128, u_in: F128, v_in: F128, r: F128) -> F128 {
 /// the same nested fold of its position's input lanes.
 ///
 /// Writes `n_positions = codeword.len() / 2^k` outputs into `out[..]`.
-fn row_batch_fold_all(codeword: &[F128], out: &mut [F128], challenges: &[F128]) -> usize {
+fn row_batch_fold_all(codeword: &[F256], out: &mut [F256], challenges: &[F256]) -> usize {
     use rayon::prelude::*;
     let num_ntts = 1usize << challenges.len();
     debug_assert_eq!(codeword.len() % num_ntts, 0);
@@ -222,7 +232,7 @@ fn row_batch_fold_all(codeword: &[F128], out: &mut [F128], challenges: &[F128]) 
         .par_chunks_mut(CHUNK)
         .enumerate()
         .for_each(|(ci, out_chunk)| {
-            let mut buf = vec![F128::ZERO; num_ntts];
+            let mut buf = vec![F256::ZERO; num_ntts];
             for (k, slot) in out_chunk.iter_mut().enumerate() {
                 let base = (ci * CHUNK + k) * num_ntts;
                 buf.copy_from_slice(&codeword[base..base + num_ntts]);
@@ -245,11 +255,11 @@ fn row_batch_fold_all(codeword: &[F128], out: &mut [F128], challenges: &[F128]) 
 /// FRI fold of a single-lane codeword at the given layer + challenge.
 /// Writes `new_len = codeword.len()/2` outputs into `out[..new_len]`.
 fn fri_fold_codeword(
-    codeword: &[F128],
-    out: &mut [F128],
+    codeword: &[F256],
+    out: &mut [F256],
     ntt: &AdditiveNttF128,
     layer: usize,
-    challenge: F128,
+    challenge: F256,
 ) -> usize {
     use rayon::prelude::*;
     let new_len = codeword.len() / 2;
@@ -266,8 +276,8 @@ fn fri_fold_codeword(
 }
 
 /// Fold one row-batch lanes-stack (length `2^a` for `a = challenges.len()`)
-/// down to a single F_{2^128} via `a` row-batch folds.
-fn row_batch_fold_one(lanes: &[F128], challenges: &[F128]) -> F128 {
+/// down to a single F_{2^256} via `a` row-batch folds.
+fn row_batch_fold_one(lanes: &[F256], challenges: &[F256]) -> F256 {
     let mut buf = lanes.to_vec();
     for &r in challenges {
         let half = buf.len() / 2;
@@ -291,12 +301,12 @@ fn row_batch_fold_one(lanes: &[F128], challenges: &[F128]) -> F128 {
 /// - `coset_idx` is the index of this coset within the `input_layer`-th codeword
 ///   divided by `2^a`. (For epoch `i` queries, `coset_idx = position >> sum_arities_through_i`.)
 fn fri_fold_coset(
-    coset: &[F128],
-    challenges: &[F128],
+    coset: &[F256],
+    challenges: &[F256],
     ntt: &AdditiveNttF128,
     input_layer: usize,
     coset_idx: usize,
-) -> F128 {
+) -> F256 {
     debug_assert_eq!(coset.len(), 1 << challenges.len());
     let mut buf = coset.to_vec();
     for (k, &r) in challenges.iter().enumerate() {
@@ -319,20 +329,33 @@ fn fri_fold_coset(
     buf[0]
 }
 
-/// Serialize a slice of `F128` to little-endian bytes (16 bytes per element).
-fn f128_slice_to_bytes(values: &[F128]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(values.len() * 16);
+/// Serialize a slice of `F256` to little-endian bytes (32 bytes per element:
+/// `c0.lo ‖ c0.hi ‖ c1.lo ‖ c1.hi`). This reproduces the in-memory
+/// `repr(C, align(32))` byte layout of `[F256]`, so a leaf hashed here matches
+/// the zero-copy `from_raw_parts` leaf the prover Merkle-trees over.
+fn f256_slice_to_bytes(values: &[F256]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 32);
     for f in values {
-        bytes.extend_from_slice(&f.lo.to_le_bytes());
-        bytes.extend_from_slice(&f.hi.to_le_bytes());
+        bytes.extend_from_slice(&f.c0.lo.to_le_bytes());
+        bytes.extend_from_slice(&f.c0.hi.to_le_bytes());
+        bytes.extend_from_slice(&f.c1.lo.to_le_bytes());
+        bytes.extend_from_slice(&f.c1.hi.to_le_bytes());
     }
     bytes
 }
 
-fn root_to_f128(root: &Hash) -> F128 {
-    F128 {
-        lo: u64::from_le_bytes(root[0..8].try_into().unwrap()),
-        hi: u64::from_le_bytes(root[8..16].try_into().unwrap()),
+/// Read a 32-byte Merkle root as a full F256 (low 16 bytes → `c0`, high 16
+/// bytes → `c1`) so the whole root binds into the transcript.
+fn root_to_f256(root: &Hash) -> F256 {
+    F256 {
+        c0: F128 {
+            lo: u64::from_le_bytes(root[0..8].try_into().unwrap()),
+            hi: u64::from_le_bytes(root[8..16].try_into().unwrap()),
+        },
+        c1: F128 {
+            lo: u64::from_le_bytes(root[16..24].try_into().unwrap()),
+            hi: u64::from_le_bytes(root[24..32].try_into().unwrap()),
+        },
     }
 }
 
@@ -341,10 +364,10 @@ fn root_to_f128(root: &Hash) -> F128 {
 // ---------------------------------------------------------------------------
 
 pub fn prove<Ch: Challenger>(
-    a_init: &[F128],
-    b: Vec<F128>,
-    target: F128,
-    initial_codeword: &[F128],
+    a_init: &[F256],
+    b: Vec<F256>,
+    target: F256,
+    initial_codeword: &[F256],
     initial_tree: &[Hash],
     ntt: &AdditiveNttF128,
     log_inv_rate: usize,
@@ -374,16 +397,16 @@ pub fn prove<Ch: Challenger>(
 /// combine + prime path).
 #[allow(clippy::too_many_arguments)]
 pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
-    a_init: &[F128],
-    mut b: Vec<F128>,
-    target: F128,
-    initial_codeword: &[F128],
+    a_init: &[F256],
+    mut b: Vec<F256>,
+    target: F256,
+    initial_codeword: &[F256],
     initial_tree: &[Hash],
     ntt: &AdditiveNttF128,
     log_inv_rate: usize,
     log_batch_size: usize,
     n_queries: usize,
-    precomputed_round0_prime: Option<(F128, F128)>,
+    precomputed_round0_prime: Option<(F256, F256)>,
     challenger: &mut Ch,
 ) -> BaseFoldProof {
     assert_eq!(a_init.len(), b.len());
@@ -408,13 +431,13 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     // Row-batch challenges (r_0..r_{log_batch_size-1}) are collected across the
     // row-batch rounds and applied in a single fused fold after the last one,
     // rather than folding the codeword once per round (≈3× less traffic).
-    let mut rb_challenges: Vec<F128> = Vec::with_capacity(log_batch_size);
+    let mut rb_challenges: Vec<F256> = Vec::with_capacity(log_batch_size);
     // The post-row-batch tree (T2) is built right after the row-batch rounds.
     // Multi-arity leaves of size 2^arity_0 give the first FRI epoch its
     // single-Merkle-open-per-query property.
     let arity_0 = arities.first().copied().unwrap_or(0);
-    let post_row_batch_leaf_f128 = 1usize << arity_0;
-    let mut post_row_batch_codeword: Vec<F128> = Vec::new();
+    let post_row_batch_leaf_f256 = 1usize << arity_0;
+    let mut post_row_batch_codeword: Vec<F256> = Vec::new();
     let mut post_row_batch_tree: Vec<Hash> = Vec::new();
     let mut post_row_batch_commit_root: Hash = [0u8; 32];
 
@@ -424,22 +447,22 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     // mem::swap promotes scratch → active for subsequent rounds). Skipping
     // the zero-init saves ~47 ms (≈320 MB streaming write) at m=29.
     let t_alloc = std::time::Instant::now();
-    let mut a_active: Vec<F128> = crate::scratch::take_f128(a_init.len());
-    let mut a_scratch: Vec<F128> = crate::scratch::take_f128(a_init.len());
+    let mut a_active: Vec<F256> = crate::scratch::take_f256(a_init.len());
+    let mut a_scratch: Vec<F256> = crate::scratch::take_f256(a_init.len());
     let mut a_len = a_init.len();
-    let mut b_scratch: Vec<F128> = crate::scratch::take_f128(b.len());
+    let mut b_scratch: Vec<F256> = crate::scratch::take_f256(b.len());
     let mut b_len = b.len();
-    let mut codeword_active: Vec<F128> = crate::scratch::take_f128(initial_codeword.len());
-    let mut codeword_scratch: Vec<F128> = crate::scratch::take_f128(initial_codeword.len());
+    let mut codeword_active: Vec<F256> = crate::scratch::take_f256(initial_codeword.len());
+    let mut codeword_scratch: Vec<F256> = crate::scratch::take_f256(initial_codeword.len());
     let mut cw_len = initial_codeword.len();
     let mut current_lanes = num_ntts;
     let upfront_alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
 
     // Per-FRI-commit storage for query opening: the committed codeword + tree
-    // + leaf size (in F_{2^128} elements).
-    let mut epoch_codewords: Vec<Vec<F128>> = Vec::with_capacity(num_fri_commits);
+    // + leaf size (in F_{2^256} elements).
+    let mut epoch_codewords: Vec<Vec<F256>> = Vec::with_capacity(num_fri_commits);
     let mut epoch_trees: Vec<Vec<Hash>> = Vec::with_capacity(num_fri_commits);
-    let mut epoch_leaf_f128s: Vec<usize> = Vec::with_capacity(num_fri_commits);
+    let mut epoch_leaf_f256s: Vec<usize> = Vec::with_capacity(num_fri_commits);
 
     use rayon::prelude::*;
 
@@ -483,7 +506,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                 (a0 * b0, (a0 + a1) * (b0 + b1))
             })
             .reduce(
-                || (F128::ZERO, F128::ZERO),
+                || (F256::ZERO, F256::ZERO),
                 |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
             )
     };
@@ -496,22 +519,22 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
 
         // For round 0, read directly from the borrowed inputs (no clone). For
         // subsequent rounds, read from the active working buffer.
-        let a_src: &[F128] = if round == 0 {
+        let a_src: &[F256] = if round == 0 {
             a_init
         } else {
             &a_active[..a_len]
         };
-        let b_src: &[F128] = &b[..b_len];
+        let b_src: &[F256] = &b[..b_len];
 
         // --- Observe this round's message (primed for round 0, otherwise
         // computed fused with the previous round's fold) and derive r.
         let u_0 = cur_u0;
         let u_2 = cur_u2;
-        challenger.observe_f128(u_0);
-        challenger.observe_f128(u_2);
+        challenger.observe_f256(u_0);
+        challenger.observe_f256(u_2);
         round_messages.push(RoundMessage { u_0, u_2 });
 
-        let r = challenger.sample_f128();
+        let r = challenger.sample_f256();
         let u_1 = running_target + u_2;
         running_target = u_0 + r * u_1 + r * r * u_2;
 
@@ -547,7 +570,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                     (af0 * bf0, (af0 + af1) * (bf0 + bf1))
                 })
                 .reduce(
-                    || (F128::ZERO, F128::ZERO),
+                    || (F256::ZERO, F256::ZERO),
                     |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
                 );
             cur_u0 = n0;
@@ -589,13 +612,13 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                     let cw_bytes: &[u8] = unsafe {
                         core::slice::from_raw_parts(
                             codeword_active.as_ptr() as *const u8,
-                            cw_len * core::mem::size_of::<F128>(),
+                            cw_len * core::mem::size_of::<F256>(),
                         )
                     };
-                    let n_leaves = cw_len / post_row_batch_leaf_f128;
+                    let n_leaves = cw_len / post_row_batch_leaf_f256;
                     post_row_batch_tree = merkle::merkle_tree(cw_bytes, n_leaves);
                     post_row_batch_commit_root = *post_row_batch_tree.last().expect("non-empty");
-                    challenger.observe_f128(root_to_f128(&post_row_batch_commit_root));
+                    challenger.observe_f256(root_to_f256(&post_row_batch_commit_root));
                     post_row_batch_codeword = codeword_active[..cw_len].to_vec();
                     if trace {
                         post_row_batch_merkle_ms += t.elapsed().as_secs_f64() * 1e3;
@@ -605,7 +628,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
         } else {
             // Round 0 reaches this branch only when log_batch_size == 0, in
             // which case it reads the (unfolded) initial codeword directly.
-            let cw_src: &[F128] = if round == 0 {
+            let cw_src: &[F256] = if round == 0 {
                 initial_codeword
             } else {
                 &codeword_active[..cw_len]
@@ -628,21 +651,21 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                 if !is_last_epoch {
                     let t = std::time::Instant::now();
                     let next_arity = arities[current_epoch + 1];
-                    let leaf_f128 = 1usize << next_arity;
-                    let n_leaves = cw_len / leaf_f128;
+                    let leaf_f256 = 1usize << next_arity;
+                    let n_leaves = cw_len / leaf_f256;
                     let cw_bytes: &[u8] = unsafe {
                         core::slice::from_raw_parts(
                             codeword_active.as_ptr() as *const u8,
-                            cw_len * core::mem::size_of::<F128>(),
+                            cw_len * core::mem::size_of::<F256>(),
                         )
                     };
                     let tree = merkle::merkle_tree(cw_bytes, n_leaves);
                     let root = *tree.last().unwrap();
-                    challenger.observe_f128(root_to_f128(&root));
+                    challenger.observe_f256(root_to_f256(&root));
                     round_commitments.push(RoundCommitment { root });
                     epoch_codewords.push(codeword_active[..cw_len].to_vec());
                     epoch_trees.push(tree);
-                    epoch_leaf_f128s.push(leaf_f128);
+                    epoch_leaf_f256s.push(leaf_f256);
                     if trace {
                         epoch_merkle_ms += t.elapsed().as_secs_f64() * 1e3;
                     }
@@ -662,7 +685,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     // --- Sample query positions and gather per-tree leaf indices.
     let t_queries = std::time::Instant::now();
     let mut queries = Vec::with_capacity(n_queries);
-    let initial_leaf_f128 = num_ntts;
+    let initial_leaf_f256 = num_ntts;
 
     let mut initial_positions = Vec::with_capacity(n_queries);
     let mut post_rb_positions = Vec::with_capacity(n_queries);
@@ -671,13 +694,13 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
         .collect();
 
     for _ in 0..n_queries {
-        let raw = challenger.sample_f128();
-        let position = (raw.lo as usize) & ((1 << k_code) - 1);
+        let raw = challenger.sample_f256();
+        let position = (raw.c0.lo as usize) & ((1 << k_code) - 1);
 
         // T1 leaf (= position).
-        let initial_start = position * initial_leaf_f128;
+        let initial_start = position * initial_leaf_f256;
         let initial_leaf =
-            initial_codeword[initial_start..initial_start + initial_leaf_f128].to_vec();
+            initial_codeword[initial_start..initial_start + initial_leaf_f256].to_vec();
         initial_positions.push(position);
 
         // T2 leaf (multi-arity coset of arity_0 consecutive positions).
@@ -685,9 +708,9 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
             Vec::new()
         } else {
             let leaf_idx = position >> arity_0;
-            let start = leaf_idx * post_row_batch_leaf_f128;
+            let start = leaf_idx * post_row_batch_leaf_f256;
             post_rb_positions.push(leaf_idx);
-            post_row_batch_codeword[start..start + post_row_batch_leaf_f128].to_vec()
+            post_row_batch_codeword[start..start + post_row_batch_leaf_f256].to_vec()
         };
 
         // Per-epoch leaves.
@@ -695,10 +718,10 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
         let mut cum_arity = arity_0;
         for i in 0..num_fri_commits {
             let p_next = position >> cum_arity;
-            let leaf_f128 = epoch_leaf_f128s[i];
-            let leaf_idx = p_next / leaf_f128;
-            let start = leaf_idx * leaf_f128;
-            epoch_leaves.push(epoch_codewords[i][start..start + leaf_f128].to_vec());
+            let leaf_f256 = epoch_leaf_f256s[i];
+            let leaf_idx = p_next / leaf_f256;
+            let start = leaf_idx * leaf_f256;
+            epoch_leaves.push(epoch_codewords[i][start..start + leaf_f256].to_vec());
             epoch_positions[i].push(leaf_idx);
             cum_arity += arities[i + 1];
         }
@@ -712,21 +735,21 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     }
 
     // --- Build one multi-proof per tree (shared across all queries).
-    let n_initial_leaves = initial_codeword.len() / initial_leaf_f128;
+    let n_initial_leaves = initial_codeword.len() / initial_leaf_f256;
     let initial_multi_proof =
         merkle::merkle_multi_proof(initial_tree, n_initial_leaves, &initial_positions);
 
     let post_row_batch_multi_proof = if arities.is_empty() {
         Vec::new()
     } else {
-        let n_leaves = post_row_batch_codeword.len() / post_row_batch_leaf_f128;
+        let n_leaves = post_row_batch_codeword.len() / post_row_batch_leaf_f256;
         merkle::merkle_multi_proof(&post_row_batch_tree, n_leaves, &post_rb_positions)
     };
 
     let mut epoch_multi_proofs = Vec::with_capacity(num_fri_commits);
     for i in 0..num_fri_commits {
-        let leaf_f128 = epoch_leaf_f128s[i];
-        let n_leaves = epoch_codewords[i].len() / leaf_f128;
+        let leaf_f256 = epoch_leaf_f256s[i];
+        let n_leaves = epoch_codewords[i].len() / leaf_f256;
         epoch_multi_proofs.push(merkle::merkle_multi_proof(
             &epoch_trees[i],
             n_leaves,
@@ -785,15 +808,15 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     // Recycle every large transient through the scratch pool. Leaving these
     // to malloc while the early-phase buffers sit in the pool would force
     // fresh page faults here each prove (see scratch.rs docs).
-    crate::scratch::give_f128(a_active);
-    crate::scratch::give_f128(a_scratch);
-    crate::scratch::give_f128(b);
-    crate::scratch::give_f128(b_scratch);
-    crate::scratch::give_f128(codeword_active);
-    crate::scratch::give_f128(codeword_scratch);
-    crate::scratch::give_f128(post_row_batch_codeword);
+    crate::scratch::give_f256(a_active);
+    crate::scratch::give_f256(a_scratch);
+    crate::scratch::give_f256(b);
+    crate::scratch::give_f256(b_scratch);
+    crate::scratch::give_f256(codeword_active);
+    crate::scratch::give_f256(codeword_scratch);
+    crate::scratch::give_f256(post_row_batch_codeword);
     for cw in epoch_codewords {
-        crate::scratch::give_f128(cw);
+        crate::scratch::give_f256(cw);
     }
 
     BaseFoldProof {
@@ -820,14 +843,14 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
 /// returns the per-round sumcheck challenges so the caller (PCS) can compute
 /// `final_b = b(challenges)` and match it against `proof.final_b`.
 pub fn verify<Ch: Challenger>(
-    target: F128,
+    target: F256,
     proof: &BaseFoldProof,
     initial_codeword_root: &Hash,
     ntt: &AdditiveNttF128,
     log_inv_rate: usize,
     log_batch_size: usize,
     challenger: &mut Ch,
-) -> Result<Vec<F128>, VerifyError> {
+) -> Result<Vec<F256>, VerifyError> {
     let log_msg_len = proof.round_messages.len();
     if log_batch_size > log_msg_len {
         return Err(VerifyError::InvalidProofShape);
@@ -864,16 +887,16 @@ pub fn verify<Ch: Challenger>(
     // boundary commits as before.
     for round in 0..log_msg_len {
         let msg = &proof.round_messages[round];
-        challenger.observe_f128(msg.u_0);
-        challenger.observe_f128(msg.u_2);
-        let r = challenger.sample_f128();
+        challenger.observe_f256(msg.u_0);
+        challenger.observe_f256(msg.u_2);
+        let r = challenger.sample_f256();
         challenges.push(r);
 
         let u_1 = running_target + msg.u_2;
         running_target = msg.u_0 + r * u_1 + r * r * msg.u_2;
 
         if round + 1 == log_batch_size && !arities.is_empty() {
-            challenger.observe_f128(root_to_f128(&proof.post_row_batch_commit.root));
+            challenger.observe_f256(root_to_f256(&proof.post_row_batch_commit.root));
         }
 
         if round >= log_batch_size {
@@ -882,7 +905,7 @@ pub fn verify<Ch: Challenger>(
                 let is_last_epoch = current_epoch + 1 == num_epochs;
                 if !is_last_epoch {
                     let root = proof.round_commitments[current_epoch].root;
-                    challenger.observe_f128(root_to_f128(&root));
+                    challenger.observe_f256(root_to_f256(&root));
                 }
                 rounds_in_epoch = 0;
                 current_epoch += 1;
@@ -913,13 +936,13 @@ pub fn verify<Ch: Challenger>(
     let n_queries = proof.queries.len();
     let mut positions = Vec::with_capacity(n_queries);
     for _ in 0..n_queries {
-        let raw = challenger.sample_f128();
-        positions.push((raw.lo as usize) & ((1 << k_code) - 1));
+        let raw = challenger.sample_f256();
+        positions.push((raw.c0.lo as usize) & ((1 << k_code) - 1));
     }
 
     let arity_0 = arities.first().copied().unwrap_or(0);
-    let initial_leaf_f128 = num_ntts; // T1: one position's row-batch lanes
-    let post_row_batch_leaf_f128 = 1usize << arity_0;
+    let initial_leaf_f256 = num_ntts; // T1: one position's row-batch lanes
+    let post_row_batch_leaf_f256 = 1usize << arity_0;
 
     if proof.epoch_multi_proofs.len() != num_fri_commits {
         return Err(VerifyError::InvalidProofShape);
@@ -944,7 +967,7 @@ pub fn verify<Ch: Challenger>(
                 epoch: 0,
             });
         }
-        if q.initial_leaf.len() != initial_leaf_f128 {
+        if q.initial_leaf.len() != initial_leaf_f256 {
             return Err(VerifyError::InitialMerkleFailed { query_index: qi });
         }
         if q.epoch_leaves.len() != num_fri_commits {
@@ -953,9 +976,9 @@ pub fn verify<Ch: Challenger>(
 
         // T1: hash the initial leaf; Merkle path verified below in a batch.
         initial_positions.push(q.position);
-        initial_hashes.push(merkle::hash_leaf(&f128_slice_to_bytes(&q.initial_leaf)));
+        initial_hashes.push(merkle::hash_leaf(&f256_slice_to_bytes(&q.initial_leaf)));
 
-        // Row-batch fold T1's lanes to a single post-row-batch F_{2^128}.
+        // Row-batch fold T1's lanes to a single post-row-batch F_{2^256}.
         let post_row_batch_value =
             row_batch_fold_one(&q.initial_leaf, &challenges[..log_batch_size]);
 
@@ -968,12 +991,12 @@ pub fn verify<Ch: Challenger>(
             // final fold output.
             expected = post_row_batch_value;
         } else {
-            if q.post_row_batch_leaf.len() != post_row_batch_leaf_f128 {
+            if q.post_row_batch_leaf.len() != post_row_batch_leaf_f256 {
                 return Err(VerifyError::InvalidProofShape);
             }
             let post_leaf_idx = q.position >> arity_0;
             post_rb_positions.push(post_leaf_idx);
-            post_rb_hashes.push(merkle::hash_leaf(&f128_slice_to_bytes(
+            post_rb_hashes.push(merkle::hash_leaf(&f256_slice_to_bytes(
                 &q.post_row_batch_leaf,
             )));
 
@@ -1010,7 +1033,7 @@ pub fn verify<Ch: Challenger>(
             let offset = p_at_this_layer & ((1usize << next_arity) - 1);
 
             epoch_positions[i].push(leaf_idx);
-            epoch_hashes[i].push(merkle::hash_leaf(&f128_slice_to_bytes(leaf)));
+            epoch_hashes[i].push(merkle::hash_leaf(&f256_slice_to_bytes(leaf)));
 
             // Check the leaf carries the expected value at the relevant offset.
             if leaf[offset] != expected {
@@ -1114,12 +1137,13 @@ fn verify_multi_with_dedup(
     let mut deduped: Vec<(usize, Hash)> = Vec::with_capacity(paired.len());
     for (p, h) in paired {
         if let Some(last) = deduped.last()
-            && last.0 == p {
-                if last.1 != h {
-                    return false;
-                }
-                continue;
+            && last.0 == p
+        {
+            if last.1 != h {
+                return false;
             }
+            continue;
+        }
         deduped.push((p, h));
     }
     let positions_sorted: Vec<usize> = deduped.iter().map(|(p, _)| *p).collect();

@@ -26,7 +26,7 @@
 //! ```
 
 use flock_core::challenger::Challenger;
-use flock_core::field::F128;
+use flock_core::field::F256;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProof, R1csProofLigerito, ZClaim, bind_statement};
@@ -37,7 +37,7 @@ use flock_core::zerocheck;
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format
 /// the PCS expects (k_skip = 6 absorbed via `z_skip`; everything else is
 /// multilinear).
-pub(crate) fn quirky_x_outer_full(point: &QuirkyPoint) -> Vec<F128> {
+pub(crate) fn quirky_x_outer_full(point: &QuirkyPoint) -> Vec<F256> {
     let mut v = Vec::with_capacity(point.x_inner_rest.len() + point.x_outer.len());
     v.extend_from_slice(&point.x_inner_rest);
     v.extend_from_slice(&point.x_outer);
@@ -58,19 +58,19 @@ pub(crate) fn quirky_x_outer_full(point: &QuirkyPoint) -> Vec<F128> {
 /// produce on `z_packed` against the claim's suffix — see
 /// [`pcs::ring_switch::s_hat_v_from_z_vec`] for the AB-claim derivation.
 pub(crate) fn open_claims_with_precomputed<Ch: Challenger>(
-    z_packed: &[F128],
+    z_packed: &[F256],
     prover_data: &pcs::ProverData,
     commitment: &Commitment,
     claims: &[ZClaim],
-    precomputed_s_hat_v: &[Option<&[F128]>],
+    precomputed_s_hat_v: &[Option<&[F256]>],
     padding: &zerocheck::PaddingSpec,
     challenger: &mut Ch,
 ) -> pcs::BatchOpeningProof {
-    let x_fulls: Vec<Vec<F128>> = claims
+    let x_fulls: Vec<Vec<F256>> = claims
         .iter()
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let x_refs: Vec<&[F256]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     pcs::open_batch_padded_with_precomputed_s_hat_v(
         z_packed,
         prover_data,
@@ -86,20 +86,20 @@ pub(crate) fn open_claims_with_precomputed<Ch: Challenger>(
 /// transcript shape from the caller's POV; just routes through Ligerito
 /// instead of BaseFold at the final PCS step.
 pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
-    z_packed: Vec<F128>,
+    z_packed: Vec<F256>,
     prover_data: &pcs::ProverData,
     commitment: &Commitment,
     claims: &[ZClaim],
-    precomputed_s_hat_v: &[Option<&[F128]>],
+    precomputed_s_hat_v: &[Option<&[F256]>],
     padding: &zerocheck::PaddingSpec,
     lig_config: &pcs::ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> pcs::BatchOpeningProofLigerito {
-    let x_fulls: Vec<Vec<F128>> = claims
+    let x_fulls: Vec<Vec<F256>> = claims
         .iter()
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let x_refs: Vec<&[F256]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         prover_data,
@@ -116,7 +116,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
 /// Run the full R1CS proof on an F_{2^128}-packed witness.
 ///
 /// The witness is in the canonical packed form (polynomial basis: bit `r` of
-/// `z_packed[i]` = logical bit `i·128 + r`), length `2^(m - 7)`. The prover
+/// `z_packed[i]` = logical bit `i·256 + r`), length `2^(m - 8)`. The prover
 /// never unpacks; downstream R1CS/zerocheck/lincheck/PCS all consume packed
 /// representations.
 ///
@@ -124,11 +124,11 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
 /// the verifier needs to know to check the openings).
 pub fn prove<Ch: Challenger>(
     r1cs: &BlockR1cs,
-    z_packed: &[F128],
+    z_packed: &[F256],
     pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> (R1csProof, Commitment, R1csClaim) {
-    assert_eq!(z_packed.len(), 1usize << (r1cs.m - 7));
+    assert_eq!(z_packed.len(), 1usize << (r1cs.m - 8));
     assert_eq!(pcs_params.m, r1cs.m);
 
     // ---- PCS commit to z (already packed). Pass by reference — commit copies
@@ -143,23 +143,18 @@ pub fn prove<Ch: Challenger>(
     // instead of running a third block-diagonal apply.
     let a_packed_f128 = r1cs.apply_a_packed(z_packed);
     let b_packed_f128 = r1cs.apply_b_packed(z_packed);
-    let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
+    let c_packed_f128: Vec<F256> = if r1cs.c0_is_identity() {
         Vec::new() // unused — c aliases z below
     } else {
         r1cs.apply_c_packed(z_packed)
     };
 
-    // ---- View a/b/c as LSB-first bytes for zerocheck. `F128` is
+    // ---- View a/b/c as LSB-first bytes for zerocheck. `F256` is
     // `repr(C, align(16))` with two little-endian u64s; that byte layout is
     // identical to the bit packing the zerocheck consumes, so a raw cast
     // suffices — no allocation, no copy.
-    let cast = |v: &[F128]| -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                v.as_ptr() as *const u8,
-                std::mem::size_of_val(v),
-            )
-        }
+    let cast = |v: &[F256]| -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
     let a_packed: &[u8] = cast(&a_packed_f128);
     let b_packed: &[u8] = cast(&b_packed_f128);
@@ -232,7 +227,8 @@ pub fn prove<Ch: Challenger>(
     // ---- Single batched PCS open covering both z-claims via one BaseFold.
     // AB s_hat_v derived from lincheck's pre-sumcheck z_vec; skips
     // fold_1b_rows for the AB claim. Skip when k_log < LOG_PACKING.
-    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+    let s_hat_v_ab = if false {
+        // PERF TODO(f256): z_vec s_hat_v_ab fast-path disabled (needs LOG_PACKING=8 rework)
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],
@@ -240,8 +236,8 @@ pub fn prove<Ch: Challenger>(
     } else {
         None
     };
-    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_ab: Option<&[F256]> = None; /* PERF TODO(f256): z_vec s_hat_v_ab path needs LOG_PACKING=8 */
+    let pre_c: Option<&[F256]> = None /* PERF TODO(f256): s_hat_v_c capture 128-wide, needs 256 */;
     let pcs_open = open_claims_with_precomputed(
         z_packed,
         &prover_data,
@@ -266,11 +262,24 @@ pub fn prove<Ch: Challenger>(
 /// (commit, zerocheck, lincheck); only the final PCS step differs.
 pub fn prove_ligerito<Ch: Challenger>(
     r1cs: &BlockR1cs,
-    z_packed: Vec<F128>,
+    z_packed: Vec<F256>,
     pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    assert_eq!(z_packed.len(), 1usize << (r1cs.m - 7));
+    // Run the whole prove on a big-stack worker: the deep F256 prove chain
+    // (zerocheck→lincheck→ring-switch→Ligerito) overflows a default thread
+    // stack at larger m. See `pcs::prover_stack_pool`.
+    pcs::prover_stack_pool()
+        .install(move || prove_ligerito_impl(r1cs, z_packed, pcs_params, challenger))
+}
+
+fn prove_ligerito_impl<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    z_packed: Vec<F256>,
+    pcs_params: &PcsParams,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    assert_eq!(z_packed.len(), 1usize << (r1cs.m - 8));
     assert_eq!(pcs_params.m, r1cs.m);
 
     let log_n = r1cs.m - pcs::LOG_PACKING;
@@ -284,18 +293,13 @@ pub fn prove_ligerito<Ch: Challenger>(
     // a = A·z, b = B·z; for the C = I convention c aliases z (see prove()).
     let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
     let b_packed_f128 = r1cs.apply_b_packed(&z_packed);
-    let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
+    let c_packed_f128: Vec<F256> = if r1cs.c0_is_identity() {
         Vec::new()
     } else {
         r1cs.apply_c_packed(&z_packed)
     };
-    let cast = |v: &[F128]| -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                v.as_ptr() as *const u8,
-                std::mem::size_of_val(v),
-            )
-        }
+    let cast = |v: &[F256]| -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
     let a_packed: &[u8] = cast(&a_packed_f128);
     let b_packed: &[u8] = cast(&b_packed_f128);
@@ -351,7 +355,8 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+    let s_hat_v_ab = if false {
+        // PERF TODO(f256): z_vec s_hat_v_ab fast-path disabled (needs LOG_PACKING=8 rework)
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],
@@ -359,8 +364,8 @@ pub fn prove_ligerito<Ch: Challenger>(
     } else {
         None
     };
-    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_ab: Option<&[F256]> = None; /* PERF TODO(f256): z_vec s_hat_v_ab path needs LOG_PACKING=8 */
+    let pre_c: Option<&[F256]> = None /* PERF TODO(f256): s_hat_v_c capture 128-wide, needs 256 */;
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -389,9 +394,9 @@ pub fn prove_ligerito<Ch: Challenger>(
 pub fn prove_fast_from_witness<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed_f128: Vec<F256>,
+    b_packed_f128: Vec<F256>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
@@ -414,8 +419,8 @@ pub fn prove_fast_from_witness<Ch: Challenger>(
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
     };
-    let pre_ab: Option<&[F128]> = core.s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
+    let pre_ab: Option<&[F256]> = None; /* PERF TODO(f256): z_vec s_hat_v_ab path needs LOG_PACKING=8 */
+    let pre_c: Option<&[F256]> = None /* PERF TODO(f256) */;
     let pcs_open = open_claims_with_precomputed(
         &core.z_packed,
         &core.prover_data,
@@ -436,21 +441,51 @@ pub fn prove_fast_from_witness<Ch: Challenger>(
         c: core.c,
     };
     // Recycle the packed witness (the open was its last reader).
-    flock_core::scratch::give_f128(core.z_packed);
+    flock_core::scratch::give_f256(core.z_packed);
     (proof, core.commitment, claim)
 }
 
 /// Ligerito-backend mirror of [`prove_fast_from_witness`]. Used by per-hash
 /// modules' `prove_fast_ligerito` methods.
+#[allow(clippy::too_many_arguments)]
 pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed_f128: Vec<F256>,
+    b_packed_f128: Vec<F256>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: Option<Vec<F256>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    // Big-stack worker (see `pcs::prover_stack_pool`): the F256 prove chain
+    // overflows a default thread stack at larger m.
+    pcs::prover_stack_pool().install(move || {
+        prove_fast_ligerito_from_witness_impl(
+            r1cs,
+            pcs_params,
+            z_packed,
+            a_packed_f128,
+            b_packed_f128,
+            z_packed_lincheck,
+            lincheck_circuit,
+            prefaulted_codeword,
+            challenger,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_ligerito_from_witness_impl<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F256>,
+    a_packed_f128: Vec<F256>,
+    b_packed_f128: Vec<F256>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F256>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let log_n = r1cs.m - pcs::LOG_PACKING;
@@ -486,8 +521,8 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
     };
-    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_ab: Option<&[F256]> = None; /* PERF TODO(f256): z_vec s_hat_v_ab path needs LOG_PACKING=8 */
+    let pre_c: Option<&[F256]> = None /* PERF TODO(f256): s_hat_v_c capture 128-wide, needs 256 */;
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -522,7 +557,7 @@ pub struct ProveCore {
     pub c: ZClaim,
     pub commitment: Commitment,
     pub prover_data: pcs::ProverData,
-    pub z_packed: Vec<F128>,
+    pub z_packed: Vec<F256>,
     /// Precomputed `s_hat_v` for the AB claim — derived from lincheck's
     /// pre-sumcheck `z_vec` via [`pcs::ring_switch::s_hat_v_from_z_vec`].
     /// Skips `fold_1b_rows` for the AB claim at PCS-open time.
@@ -531,12 +566,12 @@ pub struct ProveCore {
     /// 2^LOG_PACKING * 2^tail.len()`, which requires `k_log >= LOG_PACKING`).
     /// Real R1CS instances have `k_log >= 16` so this branch only fires in
     /// tiny test setups.
-    pub s_hat_v_ab: Option<Vec<F128>>,
+    pub s_hat_v_ab: Option<Vec<F256>>,
     /// Precomputed `s_hat_v` for the C claim — produced by zerocheck round 1's
     /// two-bank fusion kernel (one extra `vld1q+veorq` per chunk-lane-b_med
     /// vs the original single-bank C-side). Skips `fold_1b_rows` for the C
     /// claim at PCS-open time.
-    pub s_hat_v_c: Vec<F128>,
+    pub s_hat_v_c: Vec<F256>,
 }
 
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping
@@ -544,9 +579,9 @@ pub struct ProveCore {
 pub fn prove_fast_core<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed_f128: Vec<F256>,
+    b_packed_f128: Vec<F256>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
@@ -573,12 +608,12 @@ pub fn prove_fast_core<Ch: Challenger>(
 pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed_f128: Vec<F256>,
+    b_packed_f128: Vec<F256>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: Option<Vec<F256>>,
     challenger: &mut Ch,
 ) -> ProveCore {
     let (commitment, prover_data) = match prefaulted_codeword {
@@ -592,23 +627,23 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         useful_bits_per_block: r1cs.useful_bits,
     };
     let (zc_proof, zc_claim, s_hat_v_c) = {
-        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+        // Zero-cost &[u8] views of the F256 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
+                a_packed_f128.len() * core::mem::size_of::<F256>(),
             )
         };
         let b_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
+                b_packed_f128.len() * core::mem::size_of::<F256>(),
             )
         };
         let c_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
+                z_packed.len() * core::mem::size_of::<F256>(),
             )
         };
         zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -618,8 +653,8 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    flock_core::scratch::give_f256(a_packed_f128);
+    flock_core::scratch::give_f256(b_packed_f128);
 
     let inner_rest_len = r1cs.k_log - r1cs.k_skip;
     let x_ab = QuirkyPoint {
@@ -665,7 +700,8 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+    let s_hat_v_ab = if false {
+        // PERF TODO(f256): z_vec s_hat_v_ab fast-path disabled (needs LOG_PACKING=8 rework)
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],
@@ -712,12 +748,12 @@ pub struct ProvePhaseTimings {
 pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    z_packed: Vec<F256>,
+    a_packed_f128: Vec<F256>,
+    b_packed_f128: Vec<F256>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: Option<Vec<F256>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
@@ -750,19 +786,19 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         let a_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
+                a_packed_f128.len() * core::mem::size_of::<F256>(),
             )
         };
         let b_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
+                b_packed_f128.len() * core::mem::size_of::<F256>(),
             )
         };
         let c_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
+                z_packed.len() * core::mem::size_of::<F256>(),
             )
         };
         zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -770,8 +806,8 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    flock_core::scratch::give_f256(a_packed_f128);
+    flock_core::scratch::give_f256(b_packed_f128);
 
     let inner_rest_len = r1cs.k_log - r1cs.k_skip;
     let x_ab = QuirkyPoint {
@@ -809,7 +845,8 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         },
         value: zc_claim.c_eval,
     };
-    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+    let s_hat_v_ab = if false {
+        // PERF TODO(f256): z_vec s_hat_v_ab fast-path disabled (needs LOG_PACKING=8 rework)
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],
@@ -820,8 +857,8 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
-    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_ab: Option<&[F256]> = None; /* PERF TODO(f256): z_vec s_hat_v_ab path needs LOG_PACKING=8 */
+    let pre_c: Option<&[F256]> = None /* PERF TODO(f256): s_hat_v_c capture 128-wide, needs 256 */;
     let t0 = Instant::now();
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,

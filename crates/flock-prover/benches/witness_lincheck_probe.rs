@@ -16,7 +16,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::lincheck::{QuirkyPoint, prove_padded_capture_z_vec};
 use flock_prover::r1cs_hashes::blake3::{
     Blake3Setup, Compression, K_SKIP, generate_witness_with_ab_packed_and_lincheck,
@@ -38,10 +38,16 @@ impl Rng {
     fn next_u32(&mut self) -> u32 {
         self.next_u64() as u32
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
@@ -62,10 +68,12 @@ impl Fnv {
             self.0 = (self.0 ^ x as u64).wrapping_mul(0x100000001b3);
         }
     }
-    fn f128s(&mut self, v: &[F128]) {
+    fn f128s(&mut self, v: &[F256]) {
         for x in v {
-            self.bytes(&x.lo.to_le_bytes());
-            self.bytes(&x.hi.to_le_bytes());
+            self.bytes(&x.c0.lo.to_le_bytes());
+            self.bytes(&x.c0.hi.to_le_bytes());
+            self.bytes(&x.c1.lo.to_le_bytes());
+            self.bytes(&x.c1.hi.to_le_bytes());
         }
     }
 }

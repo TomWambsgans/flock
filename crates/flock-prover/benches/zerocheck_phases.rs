@@ -20,7 +20,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use flock_prover::challenger::{Challenger, FsChallenger};
-use flock_prover::field::{F8, F128};
+use flock_prover::field::{F8, F128, F256};
 use flock_prover::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use flock_prover::zerocheck::multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
@@ -83,15 +83,15 @@ fn prove_with_phase_timing(
     challenger.observe_label(b"flock-zerocheck-v0");
 
     // ---- sample r with protocol-fixed inner constants ----
-    let r_skip = challenger.sample_f128_vec(k_skip);
-    let r_outer = challenger.sample_f128_vec(m - k_skip - N_INNER);
-    let mut r = vec![F128::ZERO; m];
+    let r_skip = challenger.sample_f256_vec(k_skip);
+    let r_outer = challenger.sample_f256_vec(m - k_skip - N_INNER);
+    let mut r = vec![F256::ZERO; m];
     r[..k_skip].copy_from_slice(&r_skip);
     for (i, val) in small_challenges_ghash().iter().enumerate() {
-        r[k_skip + i] = *val;
+        r[k_skip + i] = F256::from_f128(*val);
     }
     for (i, val) in medium_challenges_ghash().iter().enumerate() {
-        r[k_skip + 3 + i] = *val;
+        r[k_skip + 3 + i] = F256::from_f128(*val);
     }
     r[k_skip + N_INNER..].copy_from_slice(&r_outer);
 
@@ -118,11 +118,11 @@ fn prove_with_phase_timing(
     phases.push(total - p_start);
 
     let c_s = c_s_f128();
-    let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
-    let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
-    challenger.observe_f128_slice(&round1_ab);
-    challenger.observe_f128_slice(&round1_c);
-    let z = challenger.sample_f128();
+    let round1_ab: Vec<F256> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
+    let round1_c: Vec<F256> = round1_c_opt.iter().map(|x| c_s * *x).collect();
+    challenger.observe_f256_slice(&round1_ab);
+    challenger.observe_f256_slice(&round1_c);
+    let z = challenger.sample_f256();
 
     // ---- Phase 2: C-claim interpolation ----
     p_start = total;
@@ -136,7 +136,7 @@ fn prove_with_phase_timing(
     // ---- Phase 3: Round-2 (fused fold + 1st mlv message) ----
     p_start = total;
     let fold_table = UniSkipFoldTable::new(k_skip, z);
-    let mut mlv_arg = vec![F128::ONE; n_mlv];
+    let mut mlv_arg = vec![F256::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf) = time_phase(
         "3. Round-2 fused fold + 1st mlv message",
@@ -154,10 +154,10 @@ fn prove_with_phase_timing(
     );
     phases.push(total - p_start);
 
-    challenger.observe_f128(msg_1);
-    challenger.observe_f128(msg_inf);
-    let mut mlv_rhos: Vec<F128> = Vec::with_capacity(n_mlv);
-    mlv_rhos.push(challenger.sample_f128());
+    challenger.observe_f256(msg_1);
+    challenger.observe_f256(msg_inf);
+    let mut mlv_rhos: Vec<F256> = Vec::with_capacity(n_mlv);
+    mlv_rhos.push(challenger.sample_f256());
 
     // ---- Phase 4: Rounds 3..(n_mlv + 1) — multilinear sumcheck tail ----
     p_start = total;
@@ -166,10 +166,10 @@ fn prove_with_phase_timing(
     // Ping-pong scratch buffers — mirrors prove_packed: the fused round folds
     // into a persistent buffer rather than allocating/freeing 64 MB per round.
     // (Allocated outside the timed region, so plain zero-init is fine here —
-    // the crate's `alloc_uninit_f128_vec` is crate-private.)
+    // the crate's `alloc_uninit_f256_vec` is crate-private.)
     let n_in = a_mlv.len();
     let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
-        (vec![F128::ZERO; n_in / 2], vec![F128::ZERO; n_in / 2])
+        (vec![F256::ZERO; n_in / 2], vec![F256::ZERO; n_in / 2])
     } else {
         (Vec::new(), Vec::new())
     };
@@ -180,7 +180,7 @@ fn prove_with_phase_timing(
             for i in 0..(n_mlv - 1) {
                 let rho_prev = mlv_rhos[i];
                 let log_n_before = a_mlv.len().trailing_zeros() as usize;
-                let mut r_next = vec![F128::ONE; log_n_before - 1];
+                let mut r_next = vec![F256::ONE; log_n_before - 1];
                 r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
                 if log_n_before >= 10 {
@@ -205,9 +205,12 @@ fn prove_with_phase_timing(
                     let (_m1, _mi) = round_pair_naive(&a_mlv, &b_mlv, &r_next);
                     naive_ms += t.elapsed().as_secs_f64() * 1000.0;
                 }
-                mlv_rhos.push(F128 {
-                    lo: 0xDEADBEEF + i as u64,
-                    hi: 0xC0FFEE + i as u64,
+                mlv_rhos.push(F256 {
+                    c0: F128 {
+                        lo: 0xDEADBEEF + i as u64,
+                        hi: 0xC0FFEE + i as u64,
+                    },
+                    c1: F128::ZERO,
                 });
             }
         },

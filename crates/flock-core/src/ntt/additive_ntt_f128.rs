@@ -41,7 +41,7 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
@@ -648,6 +648,74 @@ impl AdditiveNttF128 {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // F256 data path. The NTT twiddles live in F128 (the evaluation domain is
+    // an F_2-subspace ⊂ F128), and multiplication by an F128 twiddle acts
+    // coefficient-wise on F256 = (c0, c1). So an F256 additive-NTT is exactly
+    // two independent F128-plane NTTs — and because `F256` is
+    // `#[repr(C)] { c0: F128, c1: F128 }`, a `&mut [F256]` is bit-identical to
+    // a 2-lane interleaved `&mut [F128]` (lane 0 = c0-plane, lane 1 = c1-plane).
+    // We therefore reinterpret and reuse the tuned F128 kernels verbatim, at
+    // double the lane count. Zero new butterfly code, zero copies.
+    // -----------------------------------------------------------------------
+
+    /// Forward NTT of a single F256 message in place (length `2^log_d`).
+    pub fn forward_transform_f256(&self, data: &mut [F256]) {
+        self.forward_transform_interleaved(as_f128_lanes_mut(data), 2);
+    }
+
+    /// Interleaved forward NTT over `num_ntts` independent F256 lanes.
+    pub fn forward_transform_interleaved_f256(&self, data: &mut [F256], num_ntts: usize) {
+        self.forward_transform_interleaved(as_f128_lanes_mut(data), num_ntts * 2);
+    }
+
+    /// Interleaved forward NTT over F256 lanes, skipping the first
+    /// `start_layer` layers (already applied). Mirror of
+    /// [`Self::forward_transform_interleaved_from_layer`].
+    pub fn forward_transform_interleaved_from_layer_f256(
+        &self,
+        data: &mut [F256],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        self.forward_transform_interleaved_from_layer(
+            as_f128_lanes_mut(data),
+            num_ntts * 2,
+            start_layer,
+        );
+    }
+
+    /// Inverse NTT of a single F256 message in place. Each F256 coefficient's
+    /// (c0, c1) planes invert independently under the F128 twiddles — but the
+    /// scalar `inverse_transform` is a single-lane routine, so we invert the
+    /// two planes by viewing the buffer as a 2-lane interleaved layout. There
+    /// is no interleaved inverse kernel, so do it per plane via a strided view.
+    pub fn inverse_transform_f256(&self, data: &mut [F256]) {
+        // De-interleave into c0/c1 planes, invert each with the F128 kernel,
+        // re-interleave. The planes are small relative to the transform cost.
+        let n = data.len();
+        let mut c0: Vec<F128> = data.iter().map(|e| e.c0).collect();
+        let mut c1: Vec<F128> = data.iter().map(|e| e.c1).collect();
+        self.inverse_transform(&mut c0);
+        self.inverse_transform(&mut c1);
+        for i in 0..n {
+            data[i] = F256 {
+                c0: c0[i],
+                c1: c1[i],
+            };
+        }
+    }
+}
+
+/// Reinterpret a `&mut [F256]` as a 2-lane interleaved `&mut [F128]`
+/// (`out[2i] = data[i].c0`, `out[2i+1] = data[i].c1`).
+#[inline]
+fn as_f128_lanes_mut(data: &mut [F256]) -> &mut [F128] {
+    // SAFETY: F256 is `#[repr(C)] { c0: F128, c1: F128 }` with no padding, so
+    // `[F256; n]` is bit-identical to `[F128; 2n]`. F256's 32-byte alignment
+    // implies the 16-byte alignment F128 requires.
+    unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut F128, data.len() * 2) }
 }
 
 /// Like [`butterfly_interleaved_block`] but parallelizes across rows via

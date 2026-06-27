@@ -1,4 +1,4 @@
-//! HyperPlonk-style permutation check over GF(2^128).
+//! HyperPlonk-style permutation check over GF(2^256).
 //!
 //! Proves that two multilinear polynomials `f, g` over the boolean hypercube
 //! `B_μ` (`N = 2^μ` evaluations) are related by a permutation `σ` of `[0, N)`,
@@ -57,16 +57,16 @@
 //! separately) also keeps it to one opening — Ligerito's succinct verifier is not
 //! transcript-balanced for chaining two opens on one challenger.
 //!
-//! Reuses `build_eq` (`zerocheck::univariate_skip`), the `F128` field arithmetic
+//! Reuses `build_eq` (`zerocheck::univariate_skip`), the `F256` field arithmetic
 //! (incl. `inv`), the `Challenger` Fiat–Shamir trait, the PCS commit/open over
-//! F128-packed multilinears, and mirrors the eq-trick sumcheck verifier chain in
+//! F256-packed multilinears, and mirrors the eq-trick sumcheck verifier chain in
 //! `zerocheck.rs`.
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::merkle::Hash;
 use crate::pcs::ligerito::{ProverConfig, VerifierConfig};
 use crate::pcs::{
@@ -90,16 +90,16 @@ pub struct PermutationProof {
     /// Merkle root of the PCS commitment to the grand-product poly `v` (size `2N`).
     pub v_root: Hash,
     /// Claimed grand product `∏ ℓ(x)`; must be `ONE` for an honest permutation.
-    pub claimed_product: F128,
+    pub claimed_product: F256,
     /// Per-round `(G(1), G(∞))`, length `μ`.
-    pub rounds: Vec<(F128, F128)>,
-    pub f_eval: F128,
-    pub g_eval: F128,
-    pub s_sigma_eval: F128,
-    pub v_x0: F128, // v(ρ, 0)
-    pub v_x1: F128, // v(ρ, 1)
-    pub v_1x: F128, // v(1, ρ)
-    pub v_0x: F128, // v(0, ρ) — the leaf value ℓ(ρ), used in relation A
+    pub rounds: Vec<(F256, F256)>,
+    pub f_eval: F256,
+    pub g_eval: F256,
+    pub s_sigma_eval: F256,
+    pub v_x0: F256, // v(ρ, 0)
+    pub v_x1: F256, // v(ρ, 1)
+    pub v_1x: F256, // v(1, ρ)
+    pub v_0x: F256, // v(0, ρ) — the leaf value ℓ(ρ), used in relation A
     /// PCS opening of `v` at the five points `(ρ,0), (ρ,1), (1,ρ), (0,ρ)` and the
     /// product root `2N-2`. Backend (Ligerito / BaseFold) chosen by `v`'s size.
     pub v_open: BatchOpening,
@@ -110,14 +110,14 @@ pub struct PermutationProof {
 /// `v` opening and are surfaced for inspection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermutationClaim {
-    pub rho: Vec<F128>,
-    pub f_eval: F128,
-    pub g_eval: F128,
-    pub s_sigma_eval: F128,
-    pub v_x0: F128,
-    pub v_x1: F128,
-    pub v_1x: F128,
-    pub v_0x: F128,
+    pub rho: Vec<F256>,
+    pub f_eval: F256,
+    pub g_eval: F256,
+    pub s_sigma_eval: F256,
+    pub v_x0: F256,
+    pub v_x1: F256,
+    pub v_1x: F256,
+    pub v_0x: F256,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,19 +138,19 @@ pub enum VerifyError {
 // ---------------------------------------------------------------------------
 
 /// Montgomery batch inverse, **chunked-parallel**: each chunk runs its own
-/// Montgomery pass (one `F128::inv` + ~3·len muls) independently, so the work
+/// Montgomery pass (one `F256::inv` + ~3·len muls) independently, so the work
 /// parallelizes across chunks at the cost of one extra inversion per chunk
 /// (negligible: ~N/CHUNK inversions total). Panics (debug) on a zero input —
-/// `q(x) = 0` happens with probability `2⁻¹²⁸` per `x` for random `β, γ`.
-fn batch_inverse(values: &[F128]) -> Vec<F128> {
+/// `q(x) = 0` happens with probability `2⁻²⁵⁶` per `x` for random `β, γ`.
+fn batch_inverse(values: &[F256]) -> Vec<F256> {
     // Chunk large enough that the per-chunk extra inversion is in the noise, yet
     // small enough to give rayon plenty of tasks for load balancing.
     const CHUNK: usize = 1 << 14;
-    let mut out = vec![F128::ZERO; values.len()];
+    let mut out = vec![F256::ZERO; values.len()];
     out.par_chunks_mut(CHUNK)
         .zip(values.par_chunks(CHUNK))
         .for_each(|(out_c, val_c)| {
-            let mut acc = F128::ONE;
+            let mut acc = F256::ONE;
             for (o, v) in out_c.iter_mut().zip(val_c) {
                 debug_assert!(!v.is_zero(), "batch_inverse: zero input");
                 *o = acc; // prefix product within this chunk
@@ -166,17 +166,20 @@ fn batch_inverse(values: &[F128]) -> Vec<F128> {
 }
 
 /// Basis for the identity tag `s_id`: `basis[i]` is the field element with bit
-/// `i` set. `{basis_i}` are GF(2)-linearly independent, so `s_id` is injective
-/// on `B_μ` (requires `μ ≤ 128`).
-fn s_id_basis(mu: usize) -> Vec<F128> {
+/// `i` set, embedded into F256 via `F256::from_f128`. `{basis_i}` are
+/// GF(2)-linearly independent (the embedding is an injective homomorphism), so
+/// `s_id` is injective on `B_μ` (requires `μ ≤ 128`; the tag bits live in the
+/// embedded F128 part).
+fn s_id_basis(mu: usize) -> Vec<F256> {
     assert!(mu <= 128, "s_id needs μ ≤ 128 distinct bit positions");
     (0..mu)
         .map(|i| {
-            if i < 64 {
+            let b = if i < 64 {
                 F128::new(1u64 << i, 0)
             } else {
                 F128::new(0, 1u64 << (i - 64))
-            }
+            };
+            F256::from_f128(b)
         })
         .collect()
 }
@@ -184,8 +187,8 @@ fn s_id_basis(mu: usize) -> Vec<F128> {
 /// `s_id` on the hypercube: the field element whose bit pattern equals `idx`.
 /// Test-only reference; the prover builds the whole `s_id` table by doubling.
 #[cfg(test)]
-fn s_id_value(idx: usize, basis: &[F128]) -> F128 {
-    let mut acc = F128::ZERO;
+fn s_id_value(idx: usize, basis: &[F256]) -> F256 {
+    let mut acc = F256::ZERO;
     for (i, b) in basis.iter().enumerate() {
         if (idx >> i) & 1 == 1 {
             acc += *b;
@@ -195,8 +198,8 @@ fn s_id_value(idx: usize, basis: &[F128]) -> F128 {
 }
 
 /// Closed-form MLE of `s_id` at `ρ`: `Σ_i basis_i · ρ_i` (it is GF(2)-linear).
-fn s_id_eval(basis: &[F128], rho: &[F128]) -> F128 {
-    let mut acc = F128::ZERO;
+fn s_id_eval(basis: &[F256], rho: &[F256]) -> F256 {
+    let mut acc = F256::ZERO;
     for (b, r) in basis.iter().zip(rho) {
         acc += *b * *r;
     }
@@ -211,10 +214,10 @@ fn s_id_eval(basis: &[F128], rho: &[F128]) -> F128 {
 /// level's adjacent pairs and parallelizes over its `size/2` outputs; levels run
 /// in sequence (the recursion's data dependency), giving `O(N)` work at `O(log N)`
 /// depth. Identical output to the naive forward `v[N+i]=v[2i]·v[2i+1]` scan.
-fn build_grand_product(h: &[F128]) -> Vec<F128> {
+fn build_grand_product(h: &[F256]) -> Vec<F256> {
     let n = h.len();
     assert!(n.is_power_of_two() && n >= 2);
-    let mut v = vec![F128::ZERO; 2 * n];
+    let mut v = vec![F256::ZERO; 2 * n];
     v[..n].copy_from_slice(h);
     // `read` = start of the current level (size `size`); products go to
     // `write..write+size/2`, which is the next level. `read` for the next level
@@ -249,18 +252,18 @@ const PAR_THRESHOLD: usize = 1 << 12;
 /// Large folds run in parallel into a **pooled** buffer (reads old `u`, writes
 /// new), then swap and recycle the old buffer — no per-round allocation. Small
 /// folds stay serial and in place (no dispatch, no buffer).
-fn fold_in_place(u: &mut Vec<F128>, rho: F128) {
+fn fold_in_place(u: &mut Vec<F256>, rho: F256) {
     let half = u.len() / 2;
-    let one_minus = F128::ONE + rho;
+    let one_minus = F256::ONE + rho;
     if half >= PAR_THRESHOLD {
-        // `take_f128(half)` returns a length-`half` buffer; the map writes every
+        // `take_f256(half)` returns a length-`half` buffer; the map writes every
         // slot (write-before-read contract satisfied).
-        let mut out = crate::scratch::take_f128(half);
+        let mut out = crate::scratch::take_f256(half);
         out.par_iter_mut().enumerate().for_each(|(x, o)| {
             *o = u[2 * x] * one_minus + u[2 * x + 1] * rho;
         });
         let old = std::mem::replace(u, out);
-        crate::scratch::give_f128(old);
+        crate::scratch::give_f256(old);
     } else {
         for x in 0..half {
             u[x] = u[2 * x] * one_minus + u[2 * x + 1] * rho;
@@ -272,7 +275,7 @@ fn fold_in_place(u: &mut Vec<F128>, rho: F128) {
 /// Direct MLE evaluation of `table` (length `2^k`) at `point` (length `k`),
 /// binding low variable first (matches `fold_in_place`).
 #[cfg(test)]
-fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
+fn mle_eval(table: &[F256], point: &[F256]) -> F256 {
     let mut t = table.to_vec();
     for &r in point {
         fold_in_place(&mut t, r);
@@ -286,7 +289,7 @@ fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
 const PCS_LOG_INV_RATE: usize = 1;
 const PCS_LOG_BATCH_SIZE: usize = 1;
 
-/// PCS parameters for committing an `F128` multilinear in `num_vars` variables
+/// PCS parameters for committing an `F256` multilinear in `num_vars` variables
 /// (committed vector length `2^num_vars`). `m = num_vars + LOG_PACKING` so the
 /// packed-direct opening point has length `num_vars`. Verifier rebuilds these
 /// deterministically from `μ`, so the proof carries only the Merkle roots.
@@ -299,7 +302,7 @@ fn pcs_params(num_vars: usize) -> PcsParams {
     }
 }
 
-/// Ligerito prover config for an `F128` multilinear in `num_vars` variables, or
+/// Ligerito prover config for an `F256` multilinear in `num_vars` variables, or
 /// `None` when the poly is too small for Ligerito's recursion (in which case the
 /// caller uses BaseFold). Deterministic in `num_vars`, so prover and verifier
 /// reach the same backend decision.
@@ -317,7 +320,7 @@ fn ligerito_verifier_config(num_vars: usize) -> Option<VerifierConfig> {
 /// packed-direct `claims`, using Ligerito when feasible for the size and
 /// BaseFold otherwise. `poly` is consumed (Ligerito's prover takes it by value).
 fn open_adaptive<C: Challenger>(
-    poly: Vec<F128>,
+    poly: Vec<F256>,
     prover_data: &ProverData,
     commitment: &Commitment,
     claims: &[PackedDirectClaim],
@@ -379,26 +382,26 @@ fn verify_adaptive<C: Challenger>(
 /// `v(ρ,0)`, `v(ρ,1)`, `v(1,ρ)`, `v(0,ρ)`, and the product root `v[2N-2]`.
 /// Low bit is bound first, so the leading coord is `b₀` and the trailing coord
 /// is the half-selector. The root index `2N-2` has `b₀=0` and all other bits 1.
-fn v_open_points(rho: &[F128]) -> [Vec<F128>; 5] {
+fn v_open_points(rho: &[F256]) -> [Vec<F256>; 5] {
     let mu = rho.len();
-    let with_low = |bit: F128| {
+    let with_low = |bit: F256| {
         let mut p = Vec::with_capacity(mu + 1);
         p.push(bit);
         p.extend_from_slice(rho);
         p
     };
-    let with_high = |bit: F128| {
+    let with_high = |bit: F256| {
         let mut p = rho.to_vec();
         p.push(bit);
         p
     };
-    let mut root = vec![F128::ONE; mu + 1];
-    root[0] = F128::ZERO;
+    let mut root = vec![F256::ONE; mu + 1];
+    root[0] = F256::ZERO;
     [
-        with_low(F128::ZERO),  // v(ρ, 0)
-        with_low(F128::ONE),   // v(ρ, 1)
-        with_high(F128::ONE),  // v(1, ρ)
-        with_high(F128::ZERO), // v(0, ρ)
+        with_low(F256::ZERO),  // v(ρ, 0)
+        with_low(F256::ONE),   // v(ρ, 1)
+        with_high(F256::ONE),  // v(1, ρ)
+        with_high(F256::ZERO), // v(0, ρ)
         root,                  // v[2N-2]
     ]
 }
@@ -419,18 +422,18 @@ fn v_open_points(rho: &[F128]) -> [Vec<F128>; 5] {
 /// view `v(0,·)` (first half of `v`), used by relation A.
 #[allow(clippy::too_many_arguments)]
 fn round_message(
-    f: &[F128],
-    g: &[F128],
-    s_sig: &[F128],
-    a: &[F128],
-    b: &[F128],
-    c: &[F128],
-    v0: &[F128],
-    beta: F128,
-    gamma: F128,
-    alpha: F128,
+    f: &[F256],
+    g: &[F256],
+    s_sig: &[F256],
+    a: &[F256],
+    b: &[F256],
+    c: &[F256],
+    v0: &[F256],
+    beta: F256,
+    gamma: F256,
+    alpha: F256,
     eq: &SplitEqGhash,
-) -> (F128, F128) {
+) -> (F256, F256) {
     let lo = &eq.lo;
     let hi = &eq.hi;
     let block = lo.len(); // 2^n_lo  (x_lo per x_hi)
@@ -440,9 +443,9 @@ fn round_message(
     // One outer block (fixed `x_hi`): inner sum weighted by `eq_lo`, then scaled
     // once by `eq_hi[x_hi]`. `p1` omits `β·s_id[i1]` (added in closed form later);
     // `γ` is kept here (an XOR, and its eq-sum is handled the same way).
-    let block_fn = |x_hi: usize| -> (F128, F128) {
+    let block_fn = |x_hi: usize| -> (F256, F256) {
         let x_base = x_hi * block;
-        let (mut s1, mut s_inf) = (F128::ZERO, F128::ZERO);
+        let (mut s1, mut s_inf) = (F256::ZERO, F256::ZERO);
         for x_lo in 0..block {
             let xp = x_base + x_lo;
             let (i0, i1) = (2 * xp, 2 * xp + 1);
@@ -472,11 +475,11 @@ fn round_message(
     // Parallelize over the (≤128) outer blocks for big rounds; serial otherwise.
     if block * n_blocks >= PAR_THRESHOLD {
         (0..n_blocks).into_par_iter().map(block_fn).reduce(
-            || (F128::ZERO, F128::ZERO),
+            || (F256::ZERO, F256::ZERO),
             |(o0, i0), (o1, i1)| (o0 + o1, i0 + i1),
         )
     } else {
-        let (mut g_one, mut g_inf) = (F128::ZERO, F128::ZERO);
+        let (mut g_one, mut g_inf) = (F256::ZERO, F256::ZERO);
         for x_hi in 0..n_blocks {
             let (o, i) = block_fn(x_hi);
             g_one += o;
@@ -494,8 +497,8 @@ fn round_message(
 /// `s_σ(x) = s_id(σ(x))`). `f.len() == g.len() == σ.len() == 2^μ`; `σ` must be a
 /// permutation of `[0, 2^μ)`. The caller must have absorbed `f, g, σ` into `ch`.
 pub fn prove<C: Challenger>(
-    f: &[F128],
-    g: &[F128],
+    f: &[F256],
+    g: &[F256],
     sigma: &[usize],
     ch: &mut C,
 ) -> (PermutationProof, PermutationClaim) {
@@ -519,15 +522,15 @@ pub fn prove<C: Challenger>(
     };
 
     ch.observe_label(DOMAIN);
-    let beta = ch.sample_f128();
-    let gamma = ch.sample_f128();
+    let beta = ch.sample_f256();
+    let gamma = ch.sample_f256();
 
     // Tags and the fractional leaves. `s_id_vec[x]` (the field element whose bit
     // pattern is `x`) is built by doubling in O(N) — each entry is one XOR from a
     // lower one — instead of O(N·μ) per-bit recomputation. `s_σ` is then a gather:
     // `s_sig_vec[x] = s_id(σ(x)) = s_id_vec[σ(x)]`.
     let basis = s_id_basis(mu);
-    let mut s_id_vec = vec![F128::ZERO; n];
+    let mut s_id_vec = vec![F256::ZERO; n];
     for (k, &bk) in basis.iter().enumerate() {
         let half = 1usize << k;
         let (lo, hi) = s_id_vec.split_at_mut(half);
@@ -543,27 +546,27 @@ pub fn prove<C: Challenger>(
             }
         }
     }
-    let s_sig_vec: Vec<F128> = sigma.par_iter().map(|&sx| s_id_vec[sx]).collect();
-    let p: Vec<F128> = f
+    let s_sig_vec: Vec<F256> = sigma.par_iter().map(|&sx| s_id_vec[sx]).collect();
+    let p: Vec<F256> = f
         .par_iter()
         .zip(&s_id_vec)
         .map(|(fx, sx)| *fx + beta * *sx + gamma)
         .collect();
-    let q: Vec<F128> = g
+    let q: Vec<F256> = g
         .par_iter()
         .zip(&s_sig_vec)
         .map(|(gx, sx)| *gx + beta * *sx + gamma)
         .collect();
     let q_inv = batch_inverse(&q);
-    let leaves: Vec<F128> = p.par_iter().zip(&q_inv).map(|(px, qx)| *px * *qx).collect();
+    let leaves: Vec<F256> = p.par_iter().zip(&q_inv).map(|(px, qx)| *px * *qx).collect();
 
     // Grand-product tree over the leaves and its derived views. The first half
     // of `v` IS the leaves (`v(0,x) = ℓ(x)`), so no separate `h` is committed.
     let v = build_grand_product(&leaves);
-    let a: Vec<F128> = (0..n).into_par_iter().map(|i| v[2 * i]).collect();
-    let b: Vec<F128> = (0..n).into_par_iter().map(|i| v[2 * i + 1]).collect();
-    let c: Vec<F128> = v[n..2 * n].to_vec(); // c[i] = v[n+i]
-    let v0: Vec<F128> = v[..n].to_vec();
+    let a: Vec<F256> = (0..n).into_par_iter().map(|i| v[2 * i]).collect();
+    let b: Vec<F256> = (0..n).into_par_iter().map(|i| v[2 * i + 1]).collect();
+    let c: Vec<F256> = v[n..2 * n].to_vec(); // c[i] = v[n+i]
+    let v0: Vec<F256> = v[..n].to_vec();
     let claimed_product = v[2 * n - 2];
     tp("witness+v");
 
@@ -574,15 +577,15 @@ pub fn prove<C: Challenger>(
     let (commitment_v, pdata_v) = commit(&v, &params_v);
     tp("commit(v)");
     ch.observe_bytes(&commitment_v.root);
-    ch.observe_f128(claimed_product);
-    let alpha = ch.sample_f128();
-    let r = ch.sample_f128_vec(mu);
+    ch.observe_f256(claimed_product);
+    let alpha = ch.sample_f256();
+    let r = ch.sample_f256_vec(mu);
 
     // `s_id` is affine, so it is NOT folded as a working vector: its eq-weighted
     // contribution to each round's `G(1)` has the closed form
     // `β·((C_i + basis_i) + Σ_{k>i} basis_k·r_k)`, where `C_i = Σ_{k<i} basis_k·ρ_k`
     // (running). Precompute the suffix sums `S[i] = Σ_{k≥i} basis_k·r_k`.
-    let mut sid_suffix = vec![F128::ZERO; mu + 1];
+    let mut sid_suffix = vec![F256::ZERO; mu + 1];
     for i in (0..mu).rev() {
         sid_suffix[i] = basis[i] * r[i] + sid_suffix[i + 1];
     }
@@ -594,7 +597,7 @@ pub fn prove<C: Challenger>(
 
     let mut rounds = Vec::with_capacity(mu);
     let mut rho = Vec::with_capacity(mu);
-    let mut c_prefix = F128::ZERO; // Σ_{k<i} basis_k·ρ_k
+    let mut c_prefix = F256::ZERO; // Σ_{k<i} basis_k·ρ_k
     for i in 0..mu {
         let eq = SplitEqGhash::new(&r[i + 1..mu]);
         let (g1_core, g_inf) = round_message(
@@ -602,9 +605,9 @@ pub fn prove<C: Challenger>(
         );
         // Add the affine `s_id` contribution to `G(1)` in closed form.
         let g1 = g1_core + beta * ((c_prefix + basis[i]) + sid_suffix[i + 1]);
-        ch.observe_f128(g1);
-        ch.observe_f128(g_inf);
-        let rho_i = ch.sample_f128();
+        ch.observe_f256(g1);
+        ch.observe_f256(g_inf);
+        let rho_i = ch.sample_f256();
         rho.push(rho_i);
         rounds.push((g1, g_inf));
         c_prefix += basis[i] * rho_i;
@@ -681,8 +684,8 @@ pub fn verify<C: Challenger>(
     assert_eq!(proof.rounds.len(), mu);
 
     ch.observe_label(DOMAIN);
-    let beta = ch.sample_f128();
-    let gamma = ch.sample_f128();
+    let beta = ch.sample_f256();
+    let gamma = ch.sample_f256();
 
     // Rebuild the `v` commitment from the proof root + params derived from μ, and
     // observe the root at the same transcript position the prover committed.
@@ -691,27 +694,27 @@ pub fn verify<C: Challenger>(
         params: pcs_params(mu + 1),
     };
     ch.observe_bytes(&commitment_v.root);
-    ch.observe_f128(proof.claimed_product);
-    let alpha = ch.sample_f128();
-    let r = ch.sample_f128_vec(mu);
+    ch.observe_f256(proof.claimed_product);
+    let alpha = ch.sample_f256();
+    let r = ch.sample_f256_vec(mu);
 
     // eq-trick sumcheck chain (mirrors zerocheck.rs): running claim is the bare
     // inner value, ending at F(ρ). Initial zerocheck target is 0.
-    let mut c_running = F128::ZERO;
+    let mut c_running = F256::ZERO;
     let mut rho = Vec::with_capacity(mu);
     for i in 0..mu {
         let (g1, g_inf) = proof.rounds[i];
         let r_eq = r[i];
-        let one_plus_r_eq = F128::ONE + r_eq;
+        let one_plus_r_eq = F256::ONE + r_eq;
         // G(0) from consistency c_running = (1+r_eq)·G(0) + r_eq·G(1).
         let g0 = (c_running + r_eq * g1) * one_plus_r_eq.inv();
 
-        ch.observe_f128(g1);
-        ch.observe_f128(g_inf);
-        let rho_i = ch.sample_f128();
+        ch.observe_f256(g1);
+        ch.observe_f256(g_inf);
+        let rho_i = ch.sample_f256();
         rho.push(rho_i);
 
-        let one_plus_rho = F128::ONE + rho_i;
+        let one_plus_rho = F256::ONE + rho_i;
         // G(ρ) = G(0)(1+ρ) + G(1)ρ + G(∞)ρ(1+ρ).
         c_running = g0 * one_plus_rho + g1 * rho_i + g_inf * rho_i * one_plus_rho;
     }
@@ -728,7 +731,7 @@ pub fn verify<C: Challenger>(
     if c_running != expected {
         return Err(VerifyError::SumcheckFinalFailed);
     }
-    if proof.claimed_product != F128::ONE {
+    if proof.claimed_product != F256::ONE {
         return Err(VerifyError::RootNotOne);
     }
 
@@ -774,9 +777,9 @@ pub fn verify<C: Challenger>(
     })
 }
 
-fn observe_evals<C: Challenger>(ch: &mut C, evals: &[F128; 7]) {
+fn observe_evals<C: Challenger>(ch: &mut C, evals: &[F256; 7]) {
     for e in evals {
-        ch.observe_f128(*e);
+        ch.observe_f256(*e);
     }
 }
 
@@ -798,8 +801,11 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^ (z >> 31)
         }
-        fn f128(&mut self) -> F128 {
-            F128::new(self.next_u64(), self.next_u64())
+        fn f256(&mut self) -> F256 {
+            F256::new(
+                F128::new(self.next_u64(), self.next_u64()),
+                F128::new(self.next_u64(), self.next_u64()),
+            )
         }
         fn permutation(&mut self, n: usize) -> Vec<usize> {
             let mut p: Vec<usize> = (0..n).collect();
@@ -821,25 +827,25 @@ mod tests {
 
     /// Build an honest instance: random `g`, permutation `σ`, and
     /// `f(x) = g(σ⁻¹(x))` so the multiset `{(f,s_id)} = {(g,s_σ)}` holds.
-    fn honest_instance(mu: usize, seed: u64) -> (Vec<F128>, Vec<F128>, Vec<usize>) {
+    fn honest_instance(mu: usize, seed: u64) -> (Vec<F256>, Vec<F256>, Vec<usize>) {
         let n = 1usize << mu;
         let mut rng = Rng::new(seed);
-        let g: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let g: Vec<F256> = (0..n).map(|_| rng.f256()).collect();
         let sigma = rng.permutation(n);
         let sinv = invert(&sigma);
-        let f: Vec<F128> = (0..n).map(|x| g[sinv[x]]).collect();
+        let f: Vec<F256> = (0..n).map(|x| g[sinv[x]]).collect();
         (f, g, sigma)
     }
 
-    fn bind<C: Challenger>(ch: &mut C, f: &[F128], g: &[F128], sigma: &[usize]) {
-        ch.observe_f128_slice(f);
-        ch.observe_f128_slice(g);
+    fn bind<C: Challenger>(ch: &mut C, f: &[F256], g: &[F256], sigma: &[usize]) {
+        ch.observe_f256_slice(f);
+        ch.observe_f256_slice(g);
         for &s in sigma {
-            ch.observe_f128(F128::new(s as u64, 0));
+            ch.observe_f256(F256::from_f128(F128::new(s as u64, 0)));
         }
     }
 
-    fn run_prove(f: &[F128], g: &[F128], sigma: &[usize]) -> (PermutationProof, PermutationClaim) {
+    fn run_prove(f: &[F256], g: &[F256], sigma: &[usize]) -> (PermutationProof, PermutationClaim) {
         let mut ch = FsChallenger::new(b"perm-test");
         bind(&mut ch, f, g, sigma);
         prove(f, g, sigma, &mut ch)
@@ -847,8 +853,8 @@ mod tests {
 
     fn run_verify(
         mu: usize,
-        f: &[F128],
-        g: &[F128],
+        f: &[F256],
+        g: &[F256],
         sigma: &[usize],
         proof: &PermutationProof,
     ) -> Result<PermutationClaim, VerifyError> {
@@ -864,7 +870,7 @@ mod tests {
         for mu in 1..=8 {
             let (f, g, sigma) = honest_instance(mu, 0xC0FFEE ^ mu as u64);
             let (proof, claim_p) = run_prove(&f, &g, &sigma);
-            assert_eq!(proof.claimed_product, F128::ONE, "μ={mu}: ∏ℓ ≠ 1");
+            assert_eq!(proof.claimed_product, F256::ONE, "μ={mu}: ∏ℓ ≠ 1");
             let claim_v = run_verify(mu, &f, &g, &sigma, &proof).expect("verify");
             assert_eq!(claim_p, claim_v, "μ={mu}: prover/verifier claim mismatch");
         }
@@ -880,16 +886,16 @@ mod tests {
         let mut ch = FsChallenger::new(b"perm-test");
         bind(&mut ch, &f, &g, &sigma);
         ch.observe_label(DOMAIN);
-        let beta = ch.sample_f128();
-        let gamma = ch.sample_f128();
+        let beta = ch.sample_f256();
+        let gamma = ch.sample_f256();
         let n = 1usize << mu;
         let basis = s_id_basis(mu);
-        let s_id_vec: Vec<F128> = (0..n).map(|x| s_id_value(x, &basis)).collect();
-        let s_sig_vec: Vec<F128> = (0..n).map(|x| s_id_value(sigma[x], &basis)).collect();
-        let p: Vec<F128> = (0..n).map(|x| f[x] + beta * s_id_vec[x] + gamma).collect();
-        let q: Vec<F128> = (0..n).map(|x| g[x] + beta * s_sig_vec[x] + gamma).collect();
+        let s_id_vec: Vec<F256> = (0..n).map(|x| s_id_value(x, &basis)).collect();
+        let s_sig_vec: Vec<F256> = (0..n).map(|x| s_id_value(sigma[x], &basis)).collect();
+        let p: Vec<F256> = (0..n).map(|x| f[x] + beta * s_id_vec[x] + gamma).collect();
+        let q: Vec<F256> = (0..n).map(|x| g[x] + beta * s_sig_vec[x] + gamma).collect();
         let q_inv = batch_inverse(&q);
-        let leaves: Vec<F128> = (0..n).map(|x| p[x] * q_inv[x]).collect();
+        let leaves: Vec<F256> = (0..n).map(|x| p[x] * q_inv[x]).collect();
         let v = build_grand_product(&leaves);
 
         let rho = &claim.rho;
@@ -900,19 +906,19 @@ mod tests {
         assert_eq!(claim.v_0x, mle_eval(&leaves, rho));
 
         // v evaluations: low bit selects (·,0)/(·,1); high bit selects (0,·)/(1,·).
-        let mut pt_x0 = vec![F128::ZERO];
+        let mut pt_x0 = vec![F256::ZERO];
         pt_x0.extend_from_slice(rho);
-        let mut pt_x1 = vec![F128::ONE];
+        let mut pt_x1 = vec![F256::ONE];
         pt_x1.extend_from_slice(rho);
         let mut pt_1x = rho.clone();
-        pt_1x.push(F128::ONE);
+        pt_1x.push(F256::ONE);
         let mut pt_0x = rho.clone();
-        pt_0x.push(F128::ZERO);
+        pt_0x.push(F256::ZERO);
         assert_eq!(claim.v_x0, mle_eval(&v, &pt_x0));
         assert_eq!(claim.v_x1, mle_eval(&v, &pt_x1));
         assert_eq!(claim.v_1x, mle_eval(&v, &pt_1x));
         assert_eq!(claim.v_0x, mle_eval(&v, &pt_0x));
-        assert_eq!(v[2 * n - 2], F128::ONE);
+        assert_eq!(v[2 * n - 2], F256::ONE);
     }
 
     #[test]
@@ -924,7 +930,7 @@ mod tests {
         // Verifier binds a different f (flip one entry): challenges diverge, so
         // the sumcheck final consistency fails.
         let mut f_bad = f.clone();
-        f_bad[3] += F128::ONE;
+        f_bad[3] += F256::ONE;
         let res = run_verify(mu, &f_bad, &g, &sigma, &proof);
         assert!(
             matches!(res, Err(VerifyError::SumcheckFinalFailed)),
@@ -938,11 +944,11 @@ mod tests {
         let mu = 4;
         let n = 1usize << mu;
         let mut rng = Rng::new(0x9999);
-        let g: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-        let f: Vec<F128> = (0..n).map(|_| rng.f128()).collect(); // unrelated
+        let g: Vec<F256> = (0..n).map(|_| rng.f256()).collect();
+        let f: Vec<F256> = (0..n).map(|_| rng.f256()).collect(); // unrelated
         let sigma: Vec<usize> = (0..n).collect(); // identity tag
         let (proof, _) = run_prove(&f, &g, &sigma);
-        assert_ne!(proof.claimed_product, F128::ONE, "expected ∏h ≠ 1");
+        assert_ne!(proof.claimed_product, F256::ONE, "expected ∏h ≠ 1");
         let res = run_verify(mu, &f, &g, &sigma, &proof);
         assert_eq!(res, Err(VerifyError::RootNotOne));
     }
@@ -957,7 +963,9 @@ mod tests {
         let (f, g, sigma) = honest_instance(mu, 0x2468);
         let (mut proof, _) = run_prove(&f, &g, &sigma);
         match &mut proof.v_open {
-            BatchOpening::BaseFold(bf) => bf.basefold.final_a.lo ^= 1,
+            // `final_a` is an F256 after the field migration; flip a bit in its
+            // embedded F128 limb `c0`.
+            BatchOpening::BaseFold(bf) => bf.basefold.final_a.c0.lo ^= 1,
             BatchOpening::Ligerito(_) => panic!("μ={mu} should use BaseFold for v"),
         }
         let res = run_verify(mu, &f, &g, &sigma, &proof);

@@ -9,7 +9,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::lincheck::{build_quirky_eq_table, sparse_row_fold};
 use flock_prover::r1cs_hashes::sha2::{K_LOG, K_SKIP, build_matrices};
 
@@ -25,16 +25,22 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
-        }
+    fn f256(&mut self) -> F256 {
+        F256::new(
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+        )
     }
 }
 
-fn inner_product(a: &[F128], b: &[F128]) -> F128 {
-    let mut acc = F128::ZERO;
+fn inner_product(a: &[F256], b: &[F256]) -> F256 {
+    let mut acc = F256::ZERO;
     for (x, y) in a.iter().zip(b.iter()) {
         acc += *x * *y;
     }
@@ -80,11 +86,11 @@ fn main() {
     println!();
 
     let mut rng = Rng::new(0xC0FFEE_5A55);
-    let z_skip = rng.f128();
-    let x_inner_rest: Vec<F128> = (0..inner_rest_len).map(|_| rng.f128()).collect();
-    let z_vec: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
-    let r_inner_skip = rng.f128();
-    let r_inner_rest: Vec<F128> = (0..inner_rest_len).map(|_| rng.f128()).collect();
+    let z_skip = rng.f256();
+    let x_inner_rest: Vec<F256> = (0..inner_rest_len).map(|_| rng.f256()).collect();
+    let z_vec: Vec<F256> = (0..k).map(|_| rng.f256()).collect();
+    let r_inner_skip = rng.f256();
+    let r_inner_rest: Vec<F256> = (0..inner_rest_len).map(|_| rng.f256()).collect();
 
     // Stage 1: build eq_inner (used by both sparse_row_folds).
     let t_eq_inner = time_one("build_quirky_eq_table (eq_inner)", 200, || {

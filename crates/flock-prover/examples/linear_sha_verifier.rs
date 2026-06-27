@@ -26,7 +26,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::lincheck::{build_quirky_eq_table, sparse_row_fold};
 use flock_prover::r1cs_hashes::sha2::{
     H_WORDS, K, K_LOG, K_SKIP, M_WORDS, N_OUT_WORDS, N_ROUNDS, N_SCHED, SHA256_K, WORD_BITS,
@@ -36,45 +36,45 @@ use flock_prover::r1cs_hashes::sha2::{
 
 // ───────────────────────────────────────────────────────────────────────────
 // FWord: 32 F_{2^128} elements representing one 32-bit SHA-256 "word" worth
-// of phantom-witness bits. XOR is per-bit F128 XOR; rotation/shift is just
+// of phantom-witness bits. XOR is per-bit F256 XOR; rotation/shift is just
 // index rewiring.
 // ───────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-struct FWord([F128; 32]);
+struct FWord([F256; 32]);
 
 impl FWord {
     fn zero() -> Self {
-        Self([F128::ZERO; 32])
+        Self([F256::ZERO; 32])
     }
-    fn read_from(z: &[F128], base: usize) -> Self {
-        let mut w = [F128::ZERO; 32];
+    fn read_from(z: &[F256], base: usize) -> Self {
+        let mut w = [F256::ZERO; 32];
         w.copy_from_slice(&z[base..base + 32]);
         Self(w)
     }
     fn xor(&self, other: &Self) -> Self {
-        let mut w = [F128::ZERO; 32];
+        let mut w = [F256::ZERO; 32];
         for b in 0..32 {
             w[b] = self.0[b] + other.0[b];
         }
         Self(w)
     }
     fn xor3(a: &Self, b: &Self, c: &Self) -> Self {
-        let mut w = [F128::ZERO; 32];
+        let mut w = [F256::ZERO; 32];
         for i in 0..32 {
             w[i] = a.0[i] + b.0[i] + c.0[i];
         }
         Self(w)
     }
     fn rotr(&self, n: usize) -> Self {
-        let mut w = [F128::ZERO; 32];
+        let mut w = [F256::ZERO; 32];
         for i in 0..32 {
             w[i] = self.0[(i + n) % 32];
         }
         Self(w)
     }
     fn shr(&self, n: usize) -> Self {
-        let mut w = [F128::ZERO; 32];
+        let mut w = [F256::ZERO; 32];
         for i in 0..32 {
             if i + n < 32 {
                 w[i] = self.0[i + n];
@@ -115,13 +115,13 @@ fn add_inline<F: Fn(usize) -> usize>(
     x: &FWord,
     y: &FWord,
     carry_slot_fn: F,
-    z_vec: &[F128],
-    eq_inner: &[F128],
-    acc_a: &mut F128,
-    acc_b: &mut F128,
+    z_vec: &[F256],
+    eq_inner: &[F256],
+    acc_a: &mut F256,
+    acc_b: &mut F256,
 ) -> FWord {
     let mut sum = FWord::zero();
-    let mut cin: F128 = F128::ZERO;
+    let mut cin: F256 = F256::ZERO;
     for i in 0..WORD_BITS {
         sum.0[i] = x.0[i] + y.0[i] + cin;
         if i < WORD_BITS - 1 {
@@ -144,10 +144,10 @@ fn add_alloc<F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
     y: &FWord,
     carry_slot_fn: F1,
     sum_slot_fn: F2,
-    z_vec: &[F128],
-    eq_inner: &[F128],
-    acc_a: &mut F128,
-    acc_b: &mut F128,
+    z_vec: &[F256],
+    eq_inner: &[F256],
+    acc_a: &mut F256,
+    acc_b: &mut F256,
 ) -> FWord {
     let sum = add_inline(x, y, carry_slot_fn, z_vec, eq_inner, acc_a, acc_b);
     let z_const = z_vec[Z_CONST_POS];
@@ -157,7 +157,7 @@ fn add_alloc<F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
         *acc_a += sum.0[b] * eq_at_ss;
         *acc_b += z_const * eq_at_ss;
     }
-    let mut slotted = [F128::ZERO; 32];
+    let mut slotted = [F256::ZERO; 32];
     for b in 0..32 {
         slotted[b] = z_vec[sum_slot_fn(b)];
     }
@@ -166,11 +166,11 @@ fn add_alloc<F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
 
 /// Compute `(v_a, v_b) = (<eq_inner, A_0·z_vec>, <eq_inner, B_0·z_vec>)`
 /// in one fused walk through SHA-256's linear data flow on `z_vec`.
-fn linear_ab_consistency(z_vec: &[F128], eq_inner: &[F128]) -> (F128, F128) {
+fn linear_ab_consistency(z_vec: &[F256], eq_inner: &[F256]) -> (F256, F256) {
     assert_eq!(z_vec.len(), K);
     assert_eq!(eq_inner.len(), K);
-    let mut acc_a = F128::ZERO;
-    let mut acc_b = F128::ZERO;
+    let mut acc_a = F256::ZERO;
+    let mut acc_b = F256::ZERO;
 
     // 1. Z_CONST row: A_row = B_row = [Z_CONST_POS] → both sides = z_vec[0].
     let z0 = z_vec[Z_CONST_POS];
@@ -294,7 +294,7 @@ fn linear_ab_consistency(z_vec: &[F128], eq_inner: &[F128]) -> (F128, F128) {
         // K[r] constant: bit b of K[r] is 1 ⇒ that bit's contribution = z_vec[Z_CONST].
         let k_const = SHA256_K[r];
         let k_word: FWord = {
-            let mut w = [F128::ZERO; 32];
+            let mut w = [F256::ZERO; 32];
             for b in 0..32 {
                 if (k_const >> b) & 1 == 1 {
                     w[b] = z0;
@@ -379,16 +379,16 @@ fn linear_ab_consistency(z_vec: &[F128], eq_inner: &[F128]) -> (F128, F128) {
 fn standard_ab_consistency(
     a_0: &flock_prover::r1cs::SparseBinaryMatrix,
     b_0: &flock_prover::r1cs::SparseBinaryMatrix,
-    z_vec: &[F128],
-    eq_inner: &[F128],
-) -> (F128, F128) {
+    z_vec: &[F256],
+    eq_inner: &[F256],
+) -> (F256, F256) {
     let a_row = sparse_row_fold(a_0, eq_inner);
     let b_row = sparse_row_fold(b_0, eq_inner);
     (inner_product(&a_row, z_vec), inner_product(&b_row, z_vec))
 }
 
-fn inner_product(a: &[F128], b: &[F128]) -> F128 {
-    let mut acc = F128::ZERO;
+fn inner_product(a: &[F256], b: &[F256]) -> F256 {
+    let mut acc = F256::ZERO;
     for (x, y) in a.iter().zip(b.iter()) {
         acc += *x * *y;
     }
@@ -412,10 +412,16 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
@@ -427,23 +433,23 @@ fn main() {
     let inner_rest_len = K_LOG - K_SKIP;
 
     // ---- Build a z_vec. We use a real SHA-256 witness (boolean), packed
-    // to F128 view (each bit becomes 0 or 1 as F128). This is just a
+    // to F256 view (each bit becomes 0 or 1 as F256). This is just a
     // particular valid vector for correctness checking; the linear walk
-    // works for ANY F128 vector of length K.
+    // works for ANY F256 vector of length K.
     let h_in = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
     let m_in: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
     let z_bool = build_block_witness(&h_in, &m_in);
-    let z_vec: Vec<F128> = z_bool
+    let z_vec: Vec<F256> = z_bool
         .iter()
-        .map(|&b| if b { F128::ONE } else { F128::ZERO })
+        .map(|&b| if b { F256::ONE } else { F256::ZERO })
         .collect();
 
     // ---- Build a realistic eq_inner via build_quirky_eq_table.
     let z_skip = rng.f128();
-    let x_inner_rest: Vec<F128> = (0..inner_rest_len).map(|_| rng.f128()).collect();
+    let x_inner_rest: Vec<F256> = (0..inner_rest_len).map(|_| rng.f128()).collect();
     let eq_inner = build_quirky_eq_table(z_skip, &x_inner_rest, K_SKIP);
     assert_eq!(eq_inner.len(), K);
 

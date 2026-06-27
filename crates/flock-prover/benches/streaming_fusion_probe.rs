@@ -14,19 +14,19 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::F128;
+use flock_prover::field::{F128, F256};
 use flock_prover::pcs::ring_switch::fold_b128_elems_split;
 
 const N_BYTES: usize = 16;
 const TABLE_SIZE: usize = 256;
 
-fn build_phi_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
+fn build_phi_byte_table(eq_r_dprime: &[F256]) -> Vec<F256> {
     assert_eq!(eq_r_dprime.len(), 128);
-    let mut tables = vec![F128 { lo: 0, hi: 0 }; N_BYTES * TABLE_SIZE];
+    let mut tables = vec![F256::ZERO; N_BYTES * TABLE_SIZE];
     for byte_idx in 0..N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..TABLE_SIZE {
-            let mut acc = F128 { lo: 0, hi: 0 };
+            let mut acc = F256::ZERO;
             for bit_in_byte in 0..8 {
                 if (value >> bit_in_byte) & 1 == 1 {
                     acc += eq_r_dprime[bit_base + bit_in_byte];
@@ -39,9 +39,9 @@ fn build_phi_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
 }
 
 #[inline(always)]
-fn apply_phi_byte_table(tables: &[F128], elem: F128) -> F128 {
-    let lo_bytes = elem.lo.to_le_bytes();
-    let hi_bytes = elem.hi.to_le_bytes();
+fn apply_phi_byte_table(tables: &[F256], elem: F256) -> F256 {
+    let lo_bytes = elem.c0.lo.to_le_bytes();
+    let hi_bytes = elem.c0.hi.to_le_bytes();
     let tables_ptr = tables.as_ptr();
     let (l0, l1, l2, l3, l4, l5, l6, l7, h0, h1, h2, h3, h4, h5, h6, h7) = unsafe {
         (
@@ -92,10 +92,16 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
@@ -104,11 +110,11 @@ fn fmt_ms(s: f64) -> String {
     format!("{:>8.2} ms", s * 1000.0)
 }
 
-fn build_eq(r: &[F128]) -> Vec<F128> {
-    let mut acc = vec![F128 { lo: 1, hi: 0 }];
+fn build_eq(r: &[F256]) -> Vec<F256> {
+    let mut acc = vec![F256::ONE];
     for &ri in r {
         let mut next = Vec::with_capacity(acc.len() * 2);
-        let one = F128 { lo: 1, hi: 0 };
+        let one = F256::ONE;
         for &a in &acc {
             next.push(a * (one + ri));
             next.push(a * ri);
@@ -143,22 +149,22 @@ fn main() {
 
     let mut rng = Rng::new(0xFEEDFACE);
 
-    let eq_lo_0: Vec<F128> = (0..b_lo).map(|_| rng.f128()).collect();
-    let eq_hi_0: Vec<F128> = (0..b_hi).map(|_| rng.f128()).collect();
-    let eq_lo_1: Vec<F128> = (0..b_lo).map(|_| rng.f128()).collect();
-    let eq_hi_1: Vec<F128> = (0..b_hi).map(|_| rng.f128()).collect();
-    let r_dprime_0: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
-    let r_dprime_1: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
+    let eq_lo_0: Vec<F256> = (0..b_lo).map(|_| rng.f128()).collect();
+    let eq_hi_0: Vec<F256> = (0..b_hi).map(|_| rng.f128()).collect();
+    let eq_lo_1: Vec<F256> = (0..b_lo).map(|_| rng.f128()).collect();
+    let eq_hi_1: Vec<F256> = (0..b_hi).map(|_| rng.f128()).collect();
+    let r_dprime_0: Vec<F256> = (0..7).map(|_| rng.f128()).collect();
+    let r_dprime_1: Vec<F256> = (0..7).map(|_| rng.f128()).collect();
     let eq_rd_0 = build_eq(&r_dprime_0);
     let eq_rd_1 = build_eq(&r_dprime_1);
     let g0 = rng.f128();
     let g1 = rng.f128();
     // a_init is the packed witness — random for the probe.
-    let a_init: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+    let a_init: Vec<F256> = (0..l).map(|_| rng.f128()).collect();
 
     // γ-scale eq_r_dprime per claim.
-    let scaled_0: Vec<F128> = eq_rd_0.iter().map(|x| g0 * *x).collect();
-    let scaled_1: Vec<F128> = eq_rd_1.iter().map(|x| g1 * *x).collect();
+    let scaled_0: Vec<F256> = eq_rd_0.iter().map(|x| g0 * *x).collect();
+    let scaled_1: Vec<F256> = eq_rd_1.iter().map(|x| g1 * *x).collect();
 
     // Warm caches with one discard run.
     {
@@ -177,8 +183,8 @@ fn main() {
     let mut a_combine_total = 0.0;
     let mut a_total = 0.0;
     let mut path_a_b = Vec::new();
-    let mut path_a_u0 = F128::ZERO;
-    let mut path_a_u2 = F128::ZERO;
+    let mut path_a_u0 = F256::ZERO;
+    let mut path_a_u2 = F256::ZERO;
     for run in 0..RUNS {
         let t_all = Instant::now();
         let t0 = Instant::now();
@@ -191,7 +197,7 @@ fn main() {
         // Combine + prime in one par_chunks_mut(2) pass (mirrors current pcs::open_batch_mixed).
         let tc = Instant::now();
         use rayon::prelude::*;
-        let mut b_combined: Vec<F128> = vec![F128 { lo: 0, hi: 0 }; l];
+        let mut b_combined: Vec<F256> = vec![F256::ZERO; l];
         let (u_0, u_2) = b_combined
             .par_chunks_mut(2)
             .enumerate()
@@ -205,7 +211,7 @@ fn main() {
                 (a0 * v_a, (a0 + a1) * (v_a + v_b))
             })
             .reduce(
-                || (F128::ZERO, F128::ZERO),
+                || (F256::ZERO, F256::ZERO),
                 |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
             );
         a_combine_total += tc.elapsed().as_secs_f64();
@@ -243,8 +249,8 @@ fn main() {
     let mut b_table_build_total = 0.0;
     let mut b_fused_pass_total = 0.0;
     let mut path_b_b = Vec::new();
-    let mut path_b_u0 = F128::ZERO;
-    let mut path_b_u2 = F128::ZERO;
+    let mut path_b_u0 = F256::ZERO;
+    let mut path_b_u2 = F256::ZERO;
     for run in 0..RUNS {
         let t_all = Instant::now();
         // Build γ-baked byte tables.
@@ -258,7 +264,7 @@ fn main() {
         // logical (i_hi, i_lo) grid).
         let tp = Instant::now();
         use rayon::prelude::*;
-        let mut b_combined: Vec<F128> = vec![F128 { lo: 0, hi: 0 }; l];
+        let mut b_combined: Vec<F256> = vec![F256::ZERO; l];
         let (u_0, u_2) = b_combined
             .par_chunks_mut(b_lo)
             .enumerate()
@@ -276,8 +282,8 @@ fn main() {
                     *slot += apply_phi_byte_table(&table_1, elem);
                 }
                 // Prime accumulation (pairs within chunk).
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
+                let mut u0 = F256::ZERO;
+                let mut u2 = F256::ZERO;
                 let a_chunk_base = i_hi * b_lo;
                 let mut i = 0;
                 while i + 1 < chunk.len() {
@@ -292,7 +298,7 @@ fn main() {
                 (u0, u2)
             })
             .reduce(
-                || (F128::ZERO, F128::ZERO),
+                || (F256::ZERO, F256::ZERO),
                 |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
             );
         b_fused_pass_total += tp.elapsed().as_secs_f64();
@@ -331,8 +337,8 @@ fn main() {
     let mut c_table_build_total = 0.0;
     let mut c_fused_pass_total = 0.0;
     let mut path_c_b = Vec::new();
-    let mut path_c_u0 = F128::ZERO;
-    let mut path_c_u2 = F128::ZERO;
+    let mut path_c_u0 = F256::ZERO;
+    let mut path_c_u2 = F256::ZERO;
     for run in 0..RUNS {
         let t_all = Instant::now();
         let tb = Instant::now();
@@ -342,16 +348,16 @@ fn main() {
 
         let tp = Instant::now();
         use rayon::prelude::*;
-        let mut b_combined: Vec<F128> = vec![F128 { lo: 0, hi: 0 }; l];
+        let mut b_combined: Vec<F256> = vec![F256::ZERO; l];
         let (u_0, u_2) = b_combined
             .par_chunks_mut(b_lo)
             .enumerate()
             .map(|(i_hi, chunk)| {
                 let e_hi_0 = eq_hi_0[i_hi];
                 let e_hi_1 = eq_hi_1[i_hi];
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                let mut scratch = [F128 { lo: 0, hi: 0 }; MICRO];
+                let mut u0 = F256::ZERO;
+                let mut u2 = F256::ZERO;
+                let mut scratch = [F256::ZERO; MICRO];
                 let a_chunk_base = i_hi * b_lo;
                 let chunk_len = chunk.len();
                 let mut i_lo_base = 0;
@@ -393,7 +399,7 @@ fn main() {
                 (u0, u2)
             })
             .reduce(
-                || (F128::ZERO, F128::ZERO),
+                || (F256::ZERO, F256::ZERO),
                 |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
             );
         c_fused_pass_total += tp.elapsed().as_secs_f64();

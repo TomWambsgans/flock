@@ -20,7 +20,7 @@
 //!   the previous one (Merlin-style duplex). SHA-256 is also used for the
 //!   Merkle commitments, so the whole system rests on a single hash.
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 use sha2::{Digest, Sha256};
 
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
@@ -56,6 +56,27 @@ pub trait Challenger: Send {
     /// Produce `n` F128 challenges, in order.
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         (0..n).map(|_| self.sample_f128()).collect()
+    }
+
+    /// Absorb a single F256 prover message. F256 messages use a distinct
+    /// transcript tag from F128, so an F256 observation can never alias an F128
+    /// one (or two F128 observations of the same total width).
+    fn observe_f256(&mut self, value: F256);
+
+    /// Absorb a slice of F256 prover messages.
+    fn observe_f256_slice(&mut self, values: &[F256]) {
+        for v in values {
+            self.observe_f256(*v);
+        }
+    }
+
+    /// Produce one F256 challenge — the soundness-bearing randomness of the
+    /// protocol (32 squeezed bytes: low 16 → `c0`, high 16 → `c1`).
+    fn sample_f256(&mut self) -> F256;
+
+    /// Produce `n` F256 challenges, in order.
+    fn sample_f256_vec(&mut self, n: usize) -> Vec<F256> {
+        (0..n).map(|_| self.sample_f256()).collect()
     }
 
     /// Prover-side PoW grinding: snapshot the current transcript state,
@@ -120,6 +141,23 @@ impl Challenger for RandomChallenger {
         let hi = splitmix64(&mut self.state);
         F128 { lo, hi }
     }
+
+    #[inline]
+    fn observe_f256(&mut self, _value: F256) {
+        // intentional no-op: random challenger is independent of prover state
+    }
+
+    fn sample_f256(&mut self) -> F256 {
+        let c0 = F128 {
+            lo: splitmix64(&mut self.state),
+            hi: splitmix64(&mut self.state),
+        };
+        let c1 = F128 {
+            lo: splitmix64(&mut self.state),
+            hi: splitmix64(&mut self.state),
+        };
+        F256 { c0, c1 }
+    }
 }
 
 #[cfg(any(test, feature = "unsound-challenger"))]
@@ -154,6 +192,8 @@ const OP_BYTES: u8 = 0x05;
 
 const KIND_SCALAR: u8 = 0x01;
 const KIND_SLICE: u8 = 0x02;
+const KIND_SCALAR256: u8 = 0x03;
+const KIND_SLICE256: u8 = 0x04;
 
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
 /// Tracks the SHA-256 squeeze count and the SHA-256 PoW checks; absorbed
@@ -215,6 +255,12 @@ impl FsChallenger {
     fn absorb_f128(&mut self, v: F128) {
         self.absorb(&v.lo.to_le_bytes());
         self.absorb(&v.hi.to_le_bytes());
+    }
+
+    #[inline]
+    fn absorb_f256(&mut self, v: F256) {
+        self.absorb_f128(v.c0);
+        self.absorb_f128(v.c1);
     }
 
     /// Squeeze `out.len()` pseudorandom bytes from the current transcript
@@ -294,6 +340,61 @@ impl Challenger for FsChallenger {
             .map(|c| F128 {
                 lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
                 hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+            })
+            .collect()
+    }
+
+    fn observe_f256(&mut self, value: F256) {
+        self.absorb(&[OP_OBSERVE, KIND_SCALAR256]);
+        self.absorb_f256(value);
+    }
+
+    fn observe_f256_slice(&mut self, values: &[F256]) {
+        self.absorb(&[OP_OBSERVE, KIND_SLICE256]);
+        self.absorb(&(values.len() as u64).to_le_bytes());
+        for v in values {
+            self.absorb_f256(*v);
+        }
+    }
+
+    fn sample_f256(&mut self) -> F256 {
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.absorb(&[OP_SQUEEZE, KIND_SCALAR256]);
+        let mut buf = [0u8; 32];
+        self.squeeze_into(&mut buf);
+        // Re-absorb the squeezed bytes so subsequent ops bind to this challenge.
+        self.absorb(&buf);
+        F256 {
+            c0: F128 {
+                lo: u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            },
+            c1: F128 {
+                lo: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+                hi: u64::from_le_bytes(buf[24..].try_into().unwrap()),
+            },
+        }
+    }
+
+    fn sample_f256_vec(&mut self, n: usize) -> Vec<F256> {
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.absorb(&[OP_SQUEEZE, KIND_SLICE256]);
+        self.absorb(&(n as u64).to_le_bytes());
+        let mut buf = vec![0u8; n * 32];
+        self.squeeze_into(&mut buf);
+        self.absorb(&buf);
+        buf.chunks_exact(32)
+            .map(|c| F256 {
+                c0: F128 {
+                    lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(c[8..16].try_into().unwrap()),
+                },
+                c1: F128 {
+                    lo: u64::from_le_bytes(c[16..24].try_into().unwrap()),
+                    hi: u64::from_le_bytes(c[24..32].try_into().unwrap()),
+                },
             })
             .collect()
     }
@@ -516,6 +617,67 @@ mod tests {
         let batch = c1.sample_f128_vec(5);
         let individual: Vec<F128> = (0..5).map(|_| c2.sample_f128()).collect();
         assert_eq!(batch, individual);
+    }
+
+    // ---- F256 challenger -----------------------------------------------------
+
+    #[test]
+    fn fs_sample_f256_vec_matches_individual() {
+        let mut c1 = FsChallenger::new(b"flock-256");
+        let mut c2 = FsChallenger::new(b"flock-256");
+        let batch = c1.sample_f256_vec(5);
+        let individual: Vec<F256> = (0..5).map(|_| c2.sample_f256()).collect();
+        // Vec uses a distinct tag from repeated scalar squeezes, so they should
+        // NOT coincide — this guards the slice/scalar domain separation.
+        assert_ne!(batch, individual);
+    }
+
+    #[test]
+    fn fs_observe_f256_changes_output() {
+        let mut c1 = FsChallenger::new(b"flock-256");
+        let mut c2 = FsChallenger::new(b"flock-256");
+        c1.observe_f256(F256::ONE);
+        c2.observe_f256(F256::ZERO);
+        assert_ne!(c1.sample_f256(), c2.sample_f256());
+    }
+
+    #[test]
+    fn fs_f256_scalar_vs_f128_dont_collide() {
+        // An F256 observation must not alias an F128 one with the same low
+        // 128 bits (distinct KIND tags).
+        let mut c1 = FsChallenger::new(b"flock");
+        let mut c2 = FsChallenger::new(b"flock");
+        c1.observe_f128(F128 { lo: 7, hi: 9 });
+        c2.observe_f256(F256::from_f128(F128 { lo: 7, hi: 9 }));
+        assert_ne!(c1.sample_f256(), c2.sample_f256());
+    }
+
+    #[test]
+    fn fs_f256_identical_scripts_match() {
+        let mut c1 = FsChallenger::new(b"flock-256");
+        let mut c2 = FsChallenger::new(b"flock-256");
+        let msg = F256 {
+            c0: F128 {
+                lo: 0x1234,
+                hi: 0x5678,
+            },
+            c1: F128 {
+                lo: 0x9abc,
+                hi: 0xdef0,
+            },
+        };
+        c1.observe_f256(msg);
+        c2.observe_f256(msg);
+        assert_eq!(c1.sample_f256_vec(4), c2.sample_f256_vec(4));
+    }
+
+    #[test]
+    fn random_f256_deterministic_per_seed() {
+        let mut c1 = RandomChallenger::new(42);
+        let mut c2 = RandomChallenger::new(42);
+        for _ in 0..16 {
+            assert_eq!(c1.sample_f256(), c2.sample_f256());
+        }
     }
 
     // ---- FsChallenger ------------------------------------------------------

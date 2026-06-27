@@ -1,7 +1,7 @@
 m = 34
-log_n = 27
+log_n = 26
 initial_k = 6
-target_security_bits = 100
+target_security_bits = 128
 analysis_version = "johnson_ood_row_union_over_bchks25_thm_4_6"
 field = "f128"
 hash = "sha256"
@@ -9,115 +9,99 @@ grinding_step = "post_commit_pre_queries"
 
 [[levels]]
 log_inv_rate = 1
-log_msg_cols = 21
+log_msg_cols = 20
 log_num_interleaved = 6
 k_recursive = 6
 regime = "johnson_ood"
 eta = 0.02
-queries = 218
+queries = 279
 grinding_bits = 0
-fold_grinding_bits = 21
+fold_grinding_bits = 0
 ood_samples = 0
-target_security_bits = 100
-expected_eps_pg_bits = 79.0
-expected_eps_query_bits = 100.2
-expected_eps_ood_bits = 118.1
+target_security_bits = 128
+expected_eps_pg_bits = 208.0
+expected_eps_query_bits = 128.3
+expected_eps_ood_bits = 246.2
 
 [[levels]]
 log_inv_rate = 2
-log_msg_cols = 18
+log_msg_cols = 17
 log_num_interleaved = 3
 k_recursive = 3
 regime = "johnson_ood"
 eta = 0.02
-queries = 106
+queries = 136
 grinding_bits = 0
-fold_grinding_bits = 16
+fold_grinding_bits = 0
 ood_samples = 1
-target_security_bits = 100
-expected_eps_pg_bits = 84.8
-expected_eps_query_bits = 100.0
-expected_eps_ood_bits = 113.3
+target_security_bits = 128
+expected_eps_pg_bits = 213.8
+expected_eps_query_bits = 128.3
+expected_eps_ood_bits = 241.4
 
 [[levels]]
 log_inv_rate = 3
-log_msg_cols = 15
+log_msg_cols = 14
 log_num_interleaved = 3
 k_recursive = 3
 regime = "johnson_ood"
 eta = 0.02
-queries = 71
+queries = 91
 grinding_bits = 0
-fold_grinding_bits = 13
+fold_grinding_bits = 0
 ood_samples = 1
-target_security_bits = 100
-expected_eps_pg_bits = 87.8
-expected_eps_query_bits = 100.9
-expected_eps_ood_bits = 112.5
+target_security_bits = 128
+expected_eps_pg_bits = 216.8
+expected_eps_query_bits = 129.3
+expected_eps_ood_bits = 240.6
 
 [[levels]]
 log_inv_rate = 4
-log_msg_cols = 12
+log_msg_cols = 11
 log_num_interleaved = 3
 k_recursive = 3
 regime = "johnson_ood"
 eta = 0.02
-queries = 53
+queries = 68
 grinding_bits = 0
-fold_grinding_bits = 10
+fold_grinding_bits = 0
 ood_samples = 1
-target_security_bits = 100
-expected_eps_pg_bits = 90.1
-expected_eps_query_bits = 100.1
-expected_eps_ood_bits = 111.8
+target_security_bits = 128
+expected_eps_pg_bits = 219.1
+expected_eps_query_bits = 128.4
+expected_eps_ood_bits = 239.9
 
 [[levels]]
 log_inv_rate = 5
-log_msg_cols = 9
+log_msg_cols = 8
 log_num_interleaved = 3
 k_recursive = 3
 regime = "johnson_ood"
 eta = 0.02
-queries = 43
+queries = 55
 grinding_bits = 0
-fold_grinding_bits = 8
+fold_grinding_bits = 0
 ood_samples = 1
-target_security_bits = 100
-expected_eps_pg_bits = 92.8
-expected_eps_query_bits = 100.9
-expected_eps_ood_bits = 111.1
+target_security_bits = 128
+expected_eps_pg_bits = 221.8
+expected_eps_query_bits = 129.0
+expected_eps_ood_bits = 239.3
 
 [[levels]]
 log_inv_rate = 6
-log_msg_cols = 6
+log_msg_cols = 5
 log_num_interleaved = 3
 k_recursive = 3
 regime = "johnson_ood"
 eta = 0.02
-queries = 36
+queries = 46
 grinding_bits = 0
-fold_grinding_bits = 6
+fold_grinding_bits = 0
 ood_samples = 1
-target_security_bits = 100
-expected_eps_pg_bits = 94.7
-expected_eps_query_bits = 100.3
-expected_eps_ood_bits = 110.5
-
-[[levels]]
-log_inv_rate = 7
-log_msg_cols = 3
-log_num_interleaved = 3
-k_recursive = 3
-regime = "johnson_ood"
-eta = 0.02
-queries = 32
-grinding_bits = 0
-fold_grinding_bits = 3
-ood_samples = 1
-target_security_bits = 100
-expected_eps_pg_bits = 97.0
-expected_eps_query_bits = 102.6
-expected_eps_ood_bits = 110.1
+target_security_bits = 128
+expected_eps_pg_bits = 223.7
+expected_eps_query_bits = 128.2
+expected_eps_ood_bits = 238.7
 
 [final_block]
-yr_log_n = 3
+yr_log_n = 5

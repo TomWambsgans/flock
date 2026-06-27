@@ -17,7 +17,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::{F8, F128};
+use flock_prover::field::{F8, F128, F256};
 use flock_prover::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use flock_prover::zerocheck::PaddingSpec;
 use flock_prover::zerocheck::univariate_skip_optimized::{
@@ -37,10 +37,16 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
@@ -70,12 +76,16 @@ fn main() {
     let c_packed: Vec<u8> = a_packed.iter().zip(&b_packed).map(|(a, b)| a & b).collect();
 
     // Construct r with the protocol-fixed challenges at the right slots.
-    let mut r: Vec<F128> = Vec::with_capacity(m);
+    let mut r: Vec<F256> = Vec::with_capacity(m);
     for _ in 0..K_SKIP {
         r.push(rng.f128());
     }
-    r.extend(small_challenges_ghash().iter().copied());
-    r.extend(medium_challenges_ghash().iter().copied());
+    r.extend(small_challenges_ghash().iter().map(|&v| F256::from_f128(v)));
+    r.extend(
+        medium_challenges_ghash()
+            .iter()
+            .map(|&v| F256::from_f128(v)),
+    );
     for _ in (K_SKIP + 7)..m {
         r.push(rng.f128());
     }
@@ -135,9 +145,16 @@ fn main() {
             &a_packed, &b_packed, &c_packed, m, K_SKIP, &r, &inv_table, &padding,
         );
     let mut h: u64 = 0xcbf29ce484222325;
-    let mut absorb = |v: &[F128]| {
+    let mut absorb = |v: &[F256]| {
         for x in v {
-            for b in x.lo.to_le_bytes().into_iter().chain(x.hi.to_le_bytes()) {
+            for b in
+                x.c0.lo
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(x.c0.hi.to_le_bytes())
+                    .chain(x.c1.lo.to_le_bytes())
+                    .chain(x.c1.hi.to_le_bytes())
+            {
                 h = (h ^ b as u64).wrapping_mul(0x100000001b3);
             }
         }

@@ -49,7 +49,7 @@
 use std::sync::OnceLock;
 
 use crate::field::gf2_8::gf8_reduce;
-use crate::field::{F8, F128, mul_by_x, phi8};
+use crate::field::{F8, F128, F256, mul_by_x, phi8};
 use crate::ntt::{AdditiveNttGf8, InvNttTableSToV8Gf8};
 
 use super::univariate_skip::build_eq;
@@ -253,6 +253,18 @@ pub fn ntt_extend_f128_vec_ghash_deg4(in_s: &[F128], table: &InvNttTableSToV8Gf8
     }
 
     out
+}
+
+/// F256 analogue of [`ntt_extend_f128_vec_ghash_deg4`]. The S→Λ₄ extension is
+/// F₂-linear, so an F256 vector extends componentwise: split into the two F128
+/// halves (`c0`, `c1`), extend each with the tuned F128 primitive, recombine as
+/// `extend(c0) + extend(c1)·u`.
+pub fn ntt_extend_f256_vec_ghash_deg4(in_s: &[F256], table: &InvNttTableSToV8Gf8) -> Vec<F256> {
+    let c0: Vec<F128> = in_s.iter().map(|x| x.c0).collect();
+    let c1: Vec<F128> = in_s.iter().map(|x| x.c1).collect();
+    let e0 = ntt_extend_f128_vec_ghash_deg4(&c0, table);
+    let e1 = ntt_extend_f128_vec_ghash_deg4(&c1, table);
+    (0..e0.len()).map(|i| F256::new(e0[i], e1[i])).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -655,10 +667,10 @@ pub fn round1_shift_reduce_extract_z_packed_deg4(
     d_packed: &[u8],
     z_packed: &[u8],
     m: usize,
-    r: &[F128],
+    r: &[F256],
     ntts: &NttPairDeg4,
     table: &InvNttTableSToV8Gf8,
-) -> (Vec<F128>, Vec<F128>) {
+) -> (Vec<F256>, Vec<F256>) {
     assert!(m >= K_SKIP + N_INNER, "m must be ≥ K_SKIP + N_INNER (=13)");
     let total_bytes = (1usize << m) / 8;
     assert_eq!(a_packed.len(), total_bytes);
@@ -675,12 +687,13 @@ pub fn round1_shift_reduce_extract_z_packed_deg4(
     // r[K_SKIP+7..] = the outer dims; eq table built from those, scaled by D⁻¹.
     let n_outer = m - K_SKIP - N_INNER;
     let eq_outer = build_eq(&r[K_SKIP + N_INNER..]);
-    let eq_outer_scaled: Vec<F128> = eq_outer.iter().map(|v| *v * d_inv_val).collect();
+    // `d_inv` is a protocol-fixed F128 subfield constant; absorb into F256 eq.
+    let eq_outer_scaled: Vec<F256> = eq_outer.iter().map(|v| v.mul_f128(d_inv_val)).collect();
     let big_outer_size = 1usize << n_outer;
 
-    let mut res_abcd = [F128::ZERO; LAMBDA4_SIZE];
+    let mut res_abcd = [F256::ZERO; LAMBDA4_SIZE];
     // z is **linear**: accumulate on S (64 lanes), extend once at end-of-call.
-    let mut res_z_on_s = [F128::ZERO; S_SIZE];
+    let mut res_z_on_s = [F256::ZERO; S_SIZE];
 
     // **16-chunk buffers** for the lane-outer convert+accumulate. abcd: 16×192 = 3 KB;
     // z (on S): 16×64 = 1 KB. Both L1-resident. Restored from the streaming
@@ -777,8 +790,8 @@ pub fn round1_shift_reduce_extract_z_packed_deg4(
         }
     }
 
-    // ----- End-of-call: extend res_z_on_s from S to Λ₄ via F128 NTT -----
-    let res_z_lifted = ntt_extend_f128_vec_ghash_deg4(&res_z_on_s, table);
+    // ----- End-of-call: extend res_z_on_s from S to Λ₄ via the NTT -----
+    let res_z_lifted = ntt_extend_f256_vec_ghash_deg4(&res_z_on_s, table);
     (res_abcd.to_vec(), res_z_lifted)
 }
 
@@ -814,23 +827,34 @@ mod tests {
                 hi: self.next_u64(),
             }
         }
+        fn f256(&mut self) -> F256 {
+            F256 {
+                c0: self.f128(),
+                c1: self.f128(),
+            }
+        }
     }
 
-    /// Build the protocol r: fix the small + medium dims, randomize the outer.
-    fn build_r(m: usize, rng: &mut Rng) -> Vec<F128> {
-        let mut r = vec![F128::ZERO; m];
+    /// Build the protocol r: fix the small + medium dims (F128 subfield
+    /// constants, embedded into F256), randomize the outer (F256).
+    fn build_r(m: usize, rng: &mut Rng) -> Vec<F256> {
+        let mut r = vec![F256::ZERO; m];
         // First K_SKIP slots are unused (consumed by univariate skip). Set to
         // arbitrary values for completeness.
         for i in 0..K_SKIP {
-            r[i] = rng.f128();
+            r[i] = rng.f256();
         }
-        // K_SKIP .. K_SKIP+3: small challenges, protocol-fixed.
-        r[K_SKIP..K_SKIP + 3].copy_from_slice(&small_challenges_deg4());
-        // K_SKIP+3 .. K_SKIP+7: medium challenges, protocol-fixed.
-        r[K_SKIP + 3..K_SKIP + 7].copy_from_slice(&medium_challenges_deg4());
+        // K_SKIP .. K_SKIP+3: small challenges, protocol-fixed (F128 → F256).
+        for (i, &small) in small_challenges_deg4().iter().enumerate() {
+            r[K_SKIP + i] = F256::from_f128(small);
+        }
+        // K_SKIP+3 .. K_SKIP+7: medium challenges, protocol-fixed (F128 → F256).
+        for (i, &med) in medium_challenges_deg4().iter().enumerate() {
+            r[K_SKIP + 3 + i] = F256::from_f128(med);
+        }
         // K_SKIP+7 .. m: outer (random).
         for i in (K_SKIP + N_INNER)..m {
-            r[i] = rng.f128();
+            r[i] = rng.f256();
         }
         r
     }

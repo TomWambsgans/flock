@@ -1,2 +1,11 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+[env]
+# The F256 (256-bit extension field) prove/verify call chains have ~2× the
+# stack-frame size of the old F128 ones and overflow the default 8 MiB thread
+# stack at larger m. The hot prove/verify entry points self-manage via dedicated
+# big-stack rayon pools (pcs::prover_stack_pool, verifier::verifier_pool); this
+# raises the default for any other std-spawned thread (e.g. libtest's per-test
+# threads, which run the chain/merkle prove paths directly).
+RUST_MIN_STACK = "268435456"

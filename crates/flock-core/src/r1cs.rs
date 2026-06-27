@@ -24,9 +24,9 @@ pub struct SparseBinaryMatrix {
 ///
 /// `k_skip` is the zerocheck's univariate-skip dimension (`k_skip ≤ k_log`).
 /// It defines how the m-dim claim point is laid out in the protocol: one
-/// univariate F128 coord binds the LSB `k_skip` bits, `k_log − k_skip`
-/// multilinear F128 coords bind the next inner bits, and `n_log` multilinear
-/// F128 coords bind the outer bits.
+/// univariate F256 coord binds the LSB `k_skip` bits, `k_log − k_skip`
+/// multilinear F256 coords bind the next inner bits, and `n_log` multilinear
+/// F256 coords bind the outer bits.
 #[derive(Debug)]
 pub struct BlockR1cs {
     pub m: usize,
@@ -161,23 +161,25 @@ impl BlockR1cs {
     }
 
     // -----------------------------------------------------------------------
-    // Packed variants: operate on F_{2^128}-packed witnesses (polynomial-basis
-    // bit layout: bit r of z_packed[i] = logical bit i·128 + r). This is the
-    // canonical witness form throughout the protocol.
+    // Packed variants: operate on F_{2^256}-packed witnesses (natural F256
+    // bit layout: bit r of z_packed[i] = logical bit i·256 + r, with bits
+    // [0,128) in c0 and [128,256) in c1). This is the canonical witness form
+    // throughout the protocol. NOTE: this is GF(2) BIT manipulation — the
+    // packed element is a bag of 256 bits, not a field value.
     // -----------------------------------------------------------------------
 
-    /// Packed `a = A · z` ∈ GF(2)^N. Output is F_{2^128}-packed (length 2^(m-7)).
-    pub fn apply_a_packed(&self, z_packed: &[crate::field::F128]) -> Vec<crate::field::F128> {
+    /// Packed `a = A · z` ∈ GF(2)^N. Output is F_{2^256}-packed (length 2^(m-8)).
+    pub fn apply_a_packed(&self, z_packed: &[crate::field::F256]) -> Vec<crate::field::F256> {
         apply_block_diag_packed(&self.a_0, z_packed, self.m, self.k_log)
     }
 
     /// Packed `b = B · z`.
-    pub fn apply_b_packed(&self, z_packed: &[crate::field::F128]) -> Vec<crate::field::F128> {
+    pub fn apply_b_packed(&self, z_packed: &[crate::field::F256]) -> Vec<crate::field::F256> {
         apply_block_diag_packed(&self.b_0, z_packed, self.m, self.k_log)
     }
 
     /// Packed `c = C · z`.
-    pub fn apply_c_packed(&self, z_packed: &[crate::field::F128]) -> Vec<crate::field::F128> {
+    pub fn apply_c_packed(&self, z_packed: &[crate::field::F256]) -> Vec<crate::field::F256> {
         apply_block_diag_packed(&self.c_0, z_packed, self.m, self.k_log)
     }
 
@@ -203,17 +205,23 @@ impl BlockR1cs {
     }
 
     /// Check the R1CS constraint `(A·z) ⊙ (B·z) = C·z` over GF(2) on a packed
-    /// witness. Per-element check is `a & b == c` bitwise.
-    pub fn satisfies_packed(&self, z_packed: &[crate::field::F128]) -> bool {
-        use crate::field::F128;
-        assert_eq!(z_packed.len(), 1usize << (self.m - 7));
+    /// witness. Per-element check is `a & b == c` bitwise over all 4 words.
+    pub fn satisfies_packed(&self, z_packed: &[crate::field::F256]) -> bool {
+        use crate::field::{F128, F256};
+        assert_eq!(z_packed.len(), 1usize << (self.m - 8));
         let a = self.apply_a_packed(z_packed);
         let b = self.apply_b_packed(z_packed);
         let c = self.apply_c_packed(z_packed);
         a.iter().zip(b.iter()).zip(c.iter()).all(|((ai, bi), ci)| {
-            let ab = F128 {
-                lo: ai.lo & bi.lo,
-                hi: ai.hi & bi.hi,
+            let ab = F256 {
+                c0: F128 {
+                    lo: ai.c0.lo & bi.c0.lo,
+                    hi: ai.c0.hi & bi.c0.hi,
+                },
+                c1: F128 {
+                    lo: ai.c1.lo & bi.c1.lo,
+                    hi: ai.c1.hi & bi.c1.hi,
+                },
             };
             ab == *ci
         })
@@ -253,8 +261,8 @@ fn apply_block_diag(m_0: &SparseBinaryMatrix, z: &[bool], k_log: usize) -> Vec<b
 
 /// Block-diagonal `(I_{2^n_log} ⊗ M_0) · z_packed` over GF(2), packed form.
 ///
-/// Computes `out_packed[i_packed] = (A · z)[i_packed * 128 .. i_packed * 128 + 128]`
-/// for an F_{2^128}-packed witness `z_packed` of length `2^(m-7)`.
+/// Computes `out_packed[i_packed] = (A · z)[i_packed * 256 .. i_packed * 256 + 256]`
+/// for an F_{2^256}-packed witness `z_packed` of length `2^(m-8)`.
 ///
 /// Block size `k = 2^k_log`; total witness has `n_outer = 2^(m - k_log)` blocks.
 /// Each block is processed independently (block-diagonal). The implementation
@@ -265,23 +273,23 @@ fn apply_block_diag(m_0: &SparseBinaryMatrix, z: &[bool], k_log: usize) -> Vec<b
 /// = `n_outer · k · s` bit ops.
 pub fn apply_block_diag_packed(
     m_0: &SparseBinaryMatrix,
-    z_packed: &[crate::field::F128],
+    z_packed: &[crate::field::F256],
     m: usize,
     k_log: usize,
-) -> Vec<crate::field::F128> {
-    use crate::field::F128;
+) -> Vec<crate::field::F256> {
+    use crate::field::F256;
     use rayon::prelude::*;
 
     let k = 1usize << k_log;
     assert_eq!(m_0.num_rows, k);
     assert_eq!(m_0.num_cols, k);
-    let n_packed = 1usize << (m - 7);
+    let n_packed = 1usize << (m - 8);
     assert_eq!(z_packed.len(), n_packed);
     let n_outer = 1usize << (m - k_log);
 
-    let mut out = vec![F128::ZERO; n_packed];
+    let mut out = vec![F256::ZERO; n_packed];
 
-    if k_log >= 7 {
+    if k_log >= 8 {
         // Fast path: flatten the matrix to CSR once (one pass over the
         // Vec<Vec> rows — amortized over the n_outer block applications),
         // then process the blocks in parallel STRIPs of 8. For each strip,
@@ -291,7 +299,7 @@ pub fn apply_block_diag_packed(
         // The strip working set is 8 blocks of z + out (8 KB at k = 2^15),
         // L1-resident; the CSR arrays stream sequentially.
         let (row_ptr, cols) = flatten_csr(m_0);
-        let f128_per_block = k / 128;
+        let f256_per_block = k / 256;
         // Strip width: 64 (u64 column bits, ~5x the 8-wide kernel) when
         // there are enough 64-block strips to keep every rayon worker busy;
         // otherwise 8 (more, smaller tasks). Single-threaded runs always
@@ -301,27 +309,27 @@ pub fn apply_block_diag_packed(
         } else {
             APPLY_STRIP
         };
-        out.par_chunks_mut(strip * f128_per_block)
-            .zip(z_packed.par_chunks(strip * f128_per_block))
+        out.par_chunks_mut(strip * f256_per_block)
+            .zip(z_packed.par_chunks(strip * f256_per_block))
             .for_each(|(out_strip, z_strip)| {
-                let n_blocks = z_strip.len() / f128_per_block;
+                let n_blocks = z_strip.len() / f256_per_block;
                 if n_blocks == 64 {
-                    apply_strip64_csr(&row_ptr, &cols, z_strip, out_strip, f128_per_block);
+                    apply_strip64_csr(&row_ptr, &cols, z_strip, out_strip, f256_per_block);
                 } else if n_blocks == APPLY_STRIP {
-                    apply_strip_csr(&row_ptr, &cols, z_strip, out_strip, f128_per_block);
+                    apply_strip_csr(&row_ptr, &cols, z_strip, out_strip, f256_per_block);
                 } else {
                     // Tail strip: per-block.
                     for (ob, zb) in out_strip
-                        .chunks_mut(f128_per_block)
-                        .zip(z_strip.chunks(f128_per_block))
+                        .chunks_mut(f256_per_block)
+                        .zip(z_strip.chunks(f256_per_block))
                     {
                         apply_one_block_csr(&row_ptr, &cols, zb, ob);
                     }
                 }
             });
     } else {
-        // Slow path (k_log < 7): blocks straddle F128 elements. Used only by
-        // small tests; production R1CS always has k_log ≥ 7.
+        // Slow path (k_log < 8): blocks straddle F256 elements. Used only by
+        // small tests; production R1CS always has k_log ≥ 8.
         for i_outer in 0..n_outer {
             let block_start_bit = i_outer * k;
             for r in 0..k {
@@ -364,13 +372,14 @@ fn flatten_csr(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     (row_ptr, cols)
 }
 
-/// View a block of F128s as u128 words (F128 is repr(C, align(16)) with two
-/// little-endian u64s — bit `b` of the u128 is logical bit `b` of the block).
+/// View a block of F256s as u128 words (each F256 is two little-endian u128s:
+/// `c0` then `c1` — bit `b` of the u128 stream is logical bit `b` of the block,
+/// since c0 holds bits [0,128) and c1 holds bits [128,256)).
 #[inline]
-fn as_u128s(block: &[crate::field::F128]) -> &[u128] {
-    // SAFETY: F128 has u128's size and alignment on all supported targets;
-    // the lo/hi little-endian layout matches the u128 bit order.
-    unsafe { std::slice::from_raw_parts(block.as_ptr() as *const u128, block.len()) }
+fn as_u128s(block: &[crate::field::F256]) -> &[u128] {
+    // SAFETY: F256 is repr(C, align(32)) = two F128s = two little-endian u128s;
+    // the c0/c1 little-endian layout matches the u128 bit order.
+    unsafe { std::slice::from_raw_parts(block.as_ptr() as *const u128, block.len() * 2) }
 }
 
 /// Apply `M_0` (CSR form) to APPLY_STRIP = 8 consecutive blocks at once.
@@ -388,20 +397,20 @@ fn as_u128s(block: &[crate::field::F128]) -> &[u128] {
 fn apply_strip_csr(
     row_ptr: &[u32],
     cols: &[u32],
-    z_strip: &[crate::field::F128],
-    out_strip: &mut [crate::field::F128],
-    f128_per_block: usize,
+    z_strip: &[crate::field::F256],
+    out_strip: &mut [crate::field::F256],
+    f256_per_block: usize,
 ) {
     use crate::bits::transpose_8_u64s_to_64_bytes;
 
-    debug_assert_eq!(z_strip.len(), APPLY_STRIP * f128_per_block);
-    debug_assert_eq!(out_strip.len(), APPLY_STRIP * f128_per_block);
-    let k = f128_per_block * 128;
+    debug_assert_eq!(z_strip.len(), APPLY_STRIP * f256_per_block);
+    debug_assert_eq!(out_strip.len(), APPLY_STRIP * f256_per_block);
+    let k = f256_per_block * 256;
     let u64_per_block = k / 64;
-    // SAFETY: F128 is repr(C, align(16)) = two little-endian u64s; viewing the
+    // SAFETY: F256 is repr(C, align(32)) = four little-endian u64s; viewing the
     // strip as u64 words preserves bit order within each block.
     let z_u64: &[u64] =
-        unsafe { std::slice::from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 2) };
+        unsafe { std::slice::from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 4) };
 
     // Phase 1: bit-transpose the 8 blocks to column-major bytes.
     let mut colbits = vec![0u8; k];
@@ -411,10 +420,13 @@ fn apply_strip_csr(
     }
 
     // Phase 2: one matrix pass for all 8 blocks; 1 byte-lookup per nonzero.
-    for out_idx in 0..f128_per_block {
-        let mut acc = [0u128; APPLY_STRIP];
-        for offset in 0..128 {
-            let r = out_idx * 128 + offset;
+    // Each output element is 256 bits: `lo`-half (bits [0,128) → c0),
+    // `hi`-half (bits [128,256) → c1).
+    for out_idx in 0..f256_per_block {
+        let mut acc_lo = [0u128; APPLY_STRIP];
+        let mut acc_hi = [0u128; APPLY_STRIP];
+        for offset in 0..256 {
+            let r = out_idx * 256 + offset;
             let lo = row_ptr[r] as usize;
             let hi = row_ptr[r + 1] as usize;
             // Bit s of `row_bits` = output bit r of block s.
@@ -423,17 +435,24 @@ fn apply_strip_csr(
                 row_bits ^= colbits[j as usize];
             }
             if row_bits != 0 {
-                for (s, a) in acc.iter_mut().enumerate() {
-                    *a |= (((row_bits >> s) & 1) as u128) << offset;
+                if offset < 128 {
+                    for (s, a) in acc_lo.iter_mut().enumerate() {
+                        *a |= (((row_bits >> s) & 1) as u128) << offset;
+                    }
+                } else {
+                    let off2 = offset - 128;
+                    for (s, a) in acc_hi.iter_mut().enumerate() {
+                        *a |= (((row_bits >> s) & 1) as u128) << off2;
+                    }
                 }
             }
         }
-        for (s, a) in acc.iter().enumerate() {
-            if *a != 0 {
-                let slot = &mut out_strip[s * f128_per_block + out_idx];
-                slot.lo |= *a as u64;
-                slot.hi |= (*a >> 64) as u64;
-            }
+        for s in 0..APPLY_STRIP {
+            let slot = &mut out_strip[s * f256_per_block + out_idx];
+            slot.c0.lo |= acc_lo[s] as u64;
+            slot.c0.hi |= (acc_lo[s] >> 64) as u64;
+            slot.c1.lo |= acc_hi[s] as u64;
+            slot.c1.hi |= (acc_hi[s] >> 64) as u64;
         }
     }
 }
@@ -468,20 +487,20 @@ fn transpose_64x64(a: &mut [u64; 64]) {
 fn apply_strip64_csr(
     row_ptr: &[u32],
     cols: &[u32],
-    z_strip: &[crate::field::F128],
-    out_strip: &mut [crate::field::F128],
-    f128_per_block: usize,
+    z_strip: &[crate::field::F256],
+    out_strip: &mut [crate::field::F256],
+    f256_per_block: usize,
 ) {
     const S: usize = 64;
-    debug_assert_eq!(z_strip.len(), S * f128_per_block);
-    let k = f128_per_block * 128;
+    debug_assert_eq!(z_strip.len(), S * f256_per_block);
+    let k = f256_per_block * 256;
     let u64_per_block = k / 64;
-    // SAFETY: F128 is repr(C, align(16)) = two little-endian u64s; u64 views
+    // SAFETY: F256 is repr(C, align(32)) = four little-endian u64s; u64 views
     // preserve bit order within each block.
     let z_u64: &[u64] =
-        unsafe { std::slice::from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 2) };
+        unsafe { std::slice::from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 4) };
     let out_u64: &mut [u64] = unsafe {
-        std::slice::from_raw_parts_mut(out_strip.as_mut_ptr() as *mut u64, out_strip.len() * 2)
+        std::slice::from_raw_parts_mut(out_strip.as_mut_ptr() as *mut u64, out_strip.len() * 4)
     };
 
     // Transpose in: colbits[j] = column j's bit across the 64 blocks.
@@ -521,49 +540,62 @@ fn apply_strip64_csr(
 fn apply_one_block_csr(
     row_ptr: &[u32],
     cols: &[u32],
-    z_block: &[crate::field::F128],
-    out_block: &mut [crate::field::F128],
+    z_block: &[crate::field::F256],
+    out_block: &mut [crate::field::F256],
 ) {
-    let z = as_u128s(z_block);
-    let f128_per_block = z_block.len();
-    for out_idx in 0..f128_per_block {
-        let mut acc: u128 = 0;
-        for offset in 0..128 {
-            let r = out_idx * 128 + offset;
+    let z = as_u128s(z_block); // 2 u128 words per F256 element
+    let f256_per_block = z_block.len();
+    for out_idx in 0..f256_per_block {
+        // 256 output bits: acc_lo = bits [0,128) → c0, acc_hi = [128,256) → c1.
+        let mut acc_lo: u128 = 0;
+        let mut acc_hi: u128 = 0;
+        for offset in 0..256 {
+            let r = out_idx * 256 + offset;
             let lo = row_ptr[r] as usize;
             let hi = row_ptr[r + 1] as usize;
             let mut row_acc: u128 = 0;
             for &j in &cols[lo..hi] {
                 row_acc ^= (z[(j >> 7) as usize] >> (j & 127)) & 1;
             }
-            acc |= row_acc << offset;
+            if offset < 128 {
+                acc_lo |= row_acc << offset;
+            } else {
+                acc_hi |= row_acc << (offset - 128);
+            }
         }
-        if acc != 0 {
-            out_block[out_idx].lo |= acc as u64;
-            out_block[out_idx].hi |= (acc >> 64) as u64;
-        }
+        let slot = &mut out_block[out_idx];
+        slot.c0.lo |= acc_lo as u64;
+        slot.c0.hi |= (acc_lo >> 64) as u64;
+        slot.c1.lo |= acc_hi as u64;
+        slot.c1.hi |= (acc_hi >> 64) as u64;
     }
 }
 
 #[inline]
-fn get_bit_packed(z_packed: &[crate::field::F128], global_bit: usize) -> bool {
-    let i_packed = global_bit / 128;
-    let local = global_bit % 128;
-    if local < 64 {
-        (z_packed[i_packed].lo >> local) & 1 == 1
-    } else {
-        (z_packed[i_packed].hi >> (local - 64)) & 1 == 1
-    }
+fn get_bit_packed(z_packed: &[crate::field::F256], global_bit: usize) -> bool {
+    let i_packed = global_bit / 256;
+    let local = global_bit % 256; // 0..256 across [c0.lo, c0.hi, c1.lo, c1.hi]
+    let e = &z_packed[i_packed];
+    let word = match local / 64 {
+        0 => e.c0.lo,
+        1 => e.c0.hi,
+        2 => e.c1.lo,
+        _ => e.c1.hi,
+    };
+    (word >> (local % 64)) & 1 == 1
 }
 
 #[inline]
-fn set_bit_packed(z_packed: &mut [crate::field::F128], global_bit: usize) {
-    let i_packed = global_bit / 128;
-    let local = global_bit % 128;
-    if local < 64 {
-        z_packed[i_packed].lo |= 1u64 << local;
-    } else {
-        z_packed[i_packed].hi |= 1u64 << (local - 64);
+fn set_bit_packed(z_packed: &mut [crate::field::F256], global_bit: usize) {
+    let i_packed = global_bit / 256;
+    let local = global_bit % 256;
+    let bit = 1u64 << (local % 64);
+    let e = &mut z_packed[i_packed];
+    match local / 64 {
+        0 => e.c0.lo |= bit,
+        1 => e.c0.hi |= bit,
+        2 => e.c1.lo |= bit,
+        _ => e.c1.hi |= bit,
     }
 }
 

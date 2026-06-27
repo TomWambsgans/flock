@@ -17,7 +17,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::{F128, mul_by_x};
+use flock_prover::field::{F128, F256};
 use flock_prover::zerocheck::univariate_skip::{SplitEqGhash, build_eq};
 use flock_prover::zerocheck::univariate_skip_optimized::{
     medium_challenges_ghash, small_challenges_ghash,
@@ -35,15 +35,21 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
+    fn f128(&mut self) -> F256 {
+        F256 {
+            c0: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
+            c1: F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            },
         }
     }
 }
 
-fn build_eq_with_geometric_medium(r: &[F128]) -> Vec<F128> {
+fn build_eq_with_geometric_medium(r: &[F256]) -> Vec<F256> {
     // r layout assumption matches round-2 eq build at k_skip=6:
     //   r[0..2] = 2 small friendlies (2nd and 3rd small after URM)
     //   r[2..6] = 4 medium friendlies (β_1, β_2, β_3, β_4)
@@ -52,12 +58,12 @@ fn build_eq_with_geometric_medium(r: &[F128]) -> Vec<F128> {
     // The medium bits at indices 2..6 use the geometric exploit; everything
     // else uses standard PMULL.
     let n = r.len();
-    let mut t = vec![F128 { lo: 0, hi: 0 }; 1usize << n];
-    t[0] = F128 { lo: 1, hi: 0 };
+    let mut t = vec![F256::ZERO; 1usize << n];
+    t[0] = F256::ONE;
 
     for i in 0..n {
         let r_i = r[i];
-        let one_minus_r = F128 { lo: 1, hi: 0 } + r_i;
+        let one_minus_r = F256::ONE + r_i;
 
         if (2..6).contains(&i) {
             // Medium bit: use mul_by_x^k exploit.
@@ -66,7 +72,7 @@ fn build_eq_with_geometric_medium(r: &[F128]) -> Vec<F128> {
                 let left = t[x] * one_minus_r;
                 let mut right = left;
                 for _ in 0..k {
-                    right = mul_by_x(right);
+                    right = right.mul_f128(F128::generator());
                 }
                 t[x | (1 << i)] = right;
                 t[x] = left;
@@ -82,14 +88,14 @@ fn build_eq_with_geometric_medium(r: &[F128]) -> Vec<F128> {
     t
 }
 
-fn make_r_round2(n: usize) -> Vec<F128> {
+fn make_r_round2(n: usize) -> Vec<F256> {
     // Mimic the round-2 eq weights: small_2, small_3, medium_1..4, then random.
     let small = small_challenges_ghash();
     let medium = medium_challenges_ghash();
     let mut r = Vec::with_capacity(n);
-    r.push(small[1]);
-    r.push(small[2]);
-    r.extend(medium.iter().copied());
+    r.push(F256::from_f128(small[1]));
+    r.push(F256::from_f128(small[2]));
+    r.extend(medium.iter().map(|&v| F256::from_f128(v)));
     let mut rng = Rng::new(0xCAFE_BABE);
     while r.len() < n {
         r.push(rng.f128());

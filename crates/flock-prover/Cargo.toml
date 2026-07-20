@@ -170,6 +170,10 @@ name = "hash_throughput"
 harness = false
 
 [[bench]]
+name = "mul64_throughput"
+harness = false
+
+[[bench]]
 name = "ecore_offload_probe"
 harness = false
 

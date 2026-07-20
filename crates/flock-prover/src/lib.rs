@@ -19,3 +19,5 @@ pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
+/// u64 wrapping-multiplication R1CS (prover-throughput benchmark statement).
+pub mod r1cs_mul64;

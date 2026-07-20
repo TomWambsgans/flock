@@ -1,8 +1,9 @@
 //! u64-multiplication proving-throughput sweep (muls proved per second).
 //!
-//! One `x·y mod 2^64` per K_LOG=13 block (see [`flock_prover::r1cs_mul64`]).
-//! Batch sizes come from `MUL64_BENCH_LOG2S` (log2 batch sizes, default
-//! "10 12 14 16 18"; minimum 9 — the m = 22 Ligerito config floor), best of
+//! One full-width `x·y → u128` per K_LOG=14 block (see
+//! [`flock_prover::r1cs_mul64`]). Batch sizes come from `MUL64_BENCH_LOG2S`
+//! (log2 batch sizes, default
+//! "10 12 14 16 18"; minimum 8 — the m = 22 Ligerito config floor), best of
 //! `MUL64_BENCH_RUNS` (default 3) after one verified warm-up. Thread count is
 //! controlled through `RAYON_NUM_THREADS`. Set `MUL64_BENCH_PHASES=1` to also
 //! print a per-phase breakdown of one run per batch size.
@@ -112,12 +113,12 @@ fn parse_log2_batches() -> Vec<u32> {
                 .parse::<u32>()
                 .expect("MUL64_BENCH_LOG2S must contain integer log2 batch sizes");
             assert!(
-                log2 >= 9,
-                "MUL64_BENCH_LOG2S values must be at least 9 (m = 22 config floor)"
+                log2 >= 8,
+                "MUL64_BENCH_LOG2S values must be at least 8 (m = 22 config floor)"
             );
             assert!(
-                log2 + 13 <= 35,
-                "MUL64_BENCH_LOG2S values must be at most 22 (m = 35 config ceiling)"
+                log2 + 14 <= 35,
+                "MUL64_BENCH_LOG2S values must be at most 21 (m = 35 config ceiling)"
             );
             log2
         })

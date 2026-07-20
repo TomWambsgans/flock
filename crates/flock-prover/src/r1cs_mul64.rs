@@ -1,43 +1,49 @@
-//! **u64 wrapping multiplication** R1CS-over-GF(2): one `p = x·y mod 2^64`
-//! per block, batched block-diagonally. Not a hash — a minimal arithmetic
-//! statement for benchmarking raw prover throughput (u64 muls proved per
-//! second). Reuses the matrix/witness plumbing from [`crate::r1cs_hashes`].
+//! **u64 × u64 → u128 multiplication** R1CS-over-GF(2): one full-width
+//! `p = x·y` (no overflow — the exact 128-bit product) per block, batched
+//! block-diagonally. Not a hash — a minimal arithmetic statement for
+//! benchmarking raw prover throughput (u64 muls proved per second). Reuses
+//! the matrix/witness plumbing from [`crate::r1cs_hashes`].
 //!
 //! ## Circuit
 //!
-//! Schoolbook multiplication, truncated mod 2^64 (Rust `wrapping_mul`):
+//! Schoolbook multiplication, full 128-bit product:
 //!
 //! 1. **Partial products** — one AND wire per `pp(j, i) = x_{i−j} · y_j`
-//!    for product bit `i ∈ [j, 64)`: `Σ_j (64 − j) = 2,080` wires.
+//!    for product bit `i ∈ [j, j+64)`: `64 × 64 = 4,096` wires.
 //! 2. **Row-by-row carry-save reduction** — 63 rounds; round `j` adds pp row
 //!    `j` into a running per-bit partial sum with one full adder per product
-//!    bit `i ∈ [j, 64)`. Each FA emits:
+//!    bit `i ∈ [j, j+64)`. Each FA emits:
 //!    - a **maj** AND wire `m = (s ⊕ c)(s ⊕ p)` (carry-out `= m ⊕ s`, kept
-//!      as a 2-term linear expression, never materialized) — skipped at
-//!      `i = 63` where the carry-out is discarded mod 2^64: 1,953 wires;
+//!      as a ≤ 2-term linear expression, never materialized): 4,032 wires —
+//!      unlike a truncated multiplier, every carry matters;
 //!    - a **materialized sum** wire `s ⊕ c ⊕ p` (multiplied by the constant
-//!      wire): 2,016 wires, of which the 63 with `i = j` are final product
-//!      bits and live in the PROD region (1,953 in the SUM region).
+//!      wire): 4,032 wires, of which the 63 with `i = j` are final product
+//!      bits and live in the PROD region (3,969 in the SUM region).
 //!
 //!    A carry produced at round `j`, bit `i` is consumed at round `j + 1`,
-//!    bit `i + 1`, so after round `i` product bit `i` is final — no separate
-//!    carry-propagate adder is needed.
+//!    bit `i + 1`, so after round `i` product bit `i < 64` is final.
+//! 3. **Final ripple-carry over bits 64..128** — after round 63 the top half
+//!    still holds pending carries; a bit-serial ripple `FA(s, c, cr)` emits
+//!    63 more maj AND wires and materializes product bits 64..127 into the
+//!    PROD region. The carry out of bit 127 is identically zero
+//!    (`x·y < 2^128`) and is not represented.
 //!
-//! Every row's support stays ≤ 4 entries, so `A_0`/`B_0` have ~16k/~12k
-//! nonzeros — far sparser than the hash circuits.
+//! Every row's support stays ≤ 5 entries, so `A_0`/`B_0` stay far sparser
+//! than the hash circuits.
 //!
-//! ## Slot layout (single block, `K = 2^13 = 8,192`)
+//! ## Slot layout (single block, `K = 2^14 = 16,384`)
 //!
 //! ```text
-//! z[0..64)       x           — free input bits
-//! z[64..128)     y           — free input bits
-//! z[128..192)    prod        — materialized product bits (p = x·y mod 2^64)
-//! z[192]         Z_CONST (= 1)
-//! z[193..256)    gap, forced 0 (empty rows)
-//! z[256..2336)   pp          — partial products, row-contiguous
-//! z[2336..4289)  maj         — FA carry AND wires
-//! z[4289..6242)  sum         — non-final FA sums
-//! z[6242..8192)  padding, forced 0
+//! z[0..64)         x           — free input bits
+//! z[64..128)       y           — free input bits
+//! z[128..256)      prod        — materialized product bits (p = x·y, 128 bits)
+//! z[256]           Z_CONST (= 1)
+//! z[257..320)      gap, forced 0 (empty rows)
+//! z[320..4416)     pp          — partial products, 64 aligned 64-bit rows
+//! z[4416..8448)    maj         — FA carry AND wires, 63 aligned 64-bit rows
+//! z[8448..12417)   sum         — non-final FA sums, 63 rows × 63 bits
+//! z[12417..12480)  rip         — ripple-carry maj AND wires (bits 64..127)
+//! z[12480..16384)  padding, forced 0
 //! ```
 
 use flock_core::field::F128;
@@ -51,27 +57,34 @@ use crate::r1cs_hashes::common::{
 // Compile-time slot layout
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Inner-dimension log: `K = 2^13 = 8,192` rows per block.
-pub const K_LOG: usize = 13;
+/// Inner-dimension log: `K = 2^14 = 16,384` rows per block.
+pub const K_LOG: usize = 14;
 pub const K: usize = 1 << K_LOG;
 /// Univariate-skip width.
 pub const K_SKIP: usize = 6;
 
 pub const WORD_BITS: usize = 64;
+/// The product is full-width: 128 bits.
+pub const PROD_BITS: usize = 2 * WORD_BITS;
 
 pub const X_BASE: usize = 0;
 pub const Y_BASE: usize = WORD_BITS; // 64
 pub const PROD_BASE: usize = 2 * WORD_BITS; // 128
-pub const Z_CONST_POS: usize = 3 * WORD_BITS; // 192
-/// Word-aligned for the packed witness builder; bits [193, 256) are a gap.
-pub const PP_BASE: usize = 4 * WORD_BITS; // 256
-/// `Σ_{j=0}^{63} (64 − j)` partial-product wires.
-pub const PP_COUNT: usize = 2080;
-pub const MAJ_BASE: usize = PP_BASE + PP_COUNT; // 2,336
-/// `Σ_{j=1}^{63} (63 − j)` FA carry (maj) wires = non-final FA sum wires.
-pub const FA_COUNT: usize = 1953;
-pub const SUM_BASE: usize = MAJ_BASE + FA_COUNT; // 4,289
-pub const USEFUL_BITS: usize = SUM_BASE + FA_COUNT; // 6,242
+pub const Z_CONST_POS: usize = PROD_BASE + PROD_BITS; // 256
+/// Word-aligned for the packed witness builder; bits [257, 320) are a gap.
+pub const PP_BASE: usize = 5 * WORD_BITS; // 320
+/// 64 rows × 64 partial-product wires.
+pub const PP_COUNT: usize = WORD_BITS * WORD_BITS; // 4,096
+pub const MAJ_BASE: usize = PP_BASE + PP_COUNT; // 4,416
+/// 63 rounds × 64 FA carry (maj) wires.
+pub const MAJ_COUNT: usize = (WORD_BITS - 1) * WORD_BITS; // 4,032
+pub const SUM_BASE: usize = MAJ_BASE + MAJ_COUNT; // 8,448
+/// 63 rounds × 63 non-final FA sum wires.
+pub const SUM_COUNT: usize = (WORD_BITS - 1) * (WORD_BITS - 1); // 3,969
+pub const RIP_BASE: usize = SUM_BASE + SUM_COUNT; // 12,417
+/// Ripple-carry maj wires for product bits 64..127.
+pub const RIP_COUNT: usize = WORD_BITS - 1; // 63
+pub const USEFUL_BITS: usize = RIP_BASE + RIP_COUNT; // 12,480
 
 // Slot accessors.
 
@@ -87,32 +100,28 @@ pub fn y_bit(b: usize) -> usize {
 pub fn prod_bit(b: usize) -> usize {
     PROD_BASE + b
 }
-/// Start of pp row `j` within the PP region: `Σ_{t<j} (64 − t)`.
-#[inline]
-fn pp_off(j: usize) -> usize {
-    WORD_BITS * j - j * (j - 1) / 2
-}
-/// Partial product `x_{i−j} · y_j` (product bit `i`, row `j`, `j ≤ i < 64`).
+/// Partial product `x_{i−j} · y_j` (product bit `i`, row `j`,
+/// `j ≤ i < j + 64`). Row `j` is the aligned word at `PP_BASE + 64j`.
 #[inline]
 pub fn pp_bit(j: usize, i: usize) -> usize {
-    PP_BASE + pp_off(j) + (i - j)
+    PP_BASE + WORD_BITS * j + (i - j)
 }
-/// Start of round `j`'s FA wires (`j ∈ [1, 64)`, `63 − j` wires per round):
-/// `Σ_{t=1}^{j−1} (63 − t)`.
-#[inline]
-fn fa_off(j: usize) -> usize {
-    (WORD_BITS - 1) * (j - 1) - j * (j - 1) / 2
-}
-/// FA carry AND wire of round `j` at product bit `i` (`j ≤ i < 63`).
+/// FA carry AND wire of round `j` at product bit `i` (`j ∈ [1, 64)`,
+/// `j ≤ i < j + 64`). Round `j` is the aligned word at `MAJ_BASE + 64(j−1)`.
 #[inline]
 pub fn maj_bit(j: usize, i: usize) -> usize {
-    MAJ_BASE + fa_off(j) + (i - j)
+    MAJ_BASE + WORD_BITS * (j - 1) + (i - j)
 }
 /// Non-final materialized FA sum of round `j` at product bit `i`
-/// (`j < i < 64`; the `i = j` sum is final and lives at [`prod_bit`]).
+/// (`j < i < j + 64`; the `i = j` sum is final and lives at [`prod_bit`]).
 #[inline]
 pub fn sum_bit(j: usize, i: usize) -> usize {
-    SUM_BASE + fa_off(j) + (i - j - 1)
+    SUM_BASE + (WORD_BITS - 1) * (j - 1) + (i - j - 1)
+}
+/// Ripple-carry maj AND wire at product bit `i ∈ [64, 127)`.
+#[inline]
+pub fn rip_bit(i: usize) -> usize {
+    RIP_BASE + (i - WORD_BITS)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -152,32 +161,40 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
 
     // Partial products: z[pp(j, i)] = x_{i−j} · y_j.
     for j in 0..WORD_BITS {
-        for i in j..WORD_BITS {
+        for i in j..j + WORD_BITS {
             let s = pp_bit(j, i);
             a_rows[s] = vec![x_bit(i - j)];
             b_rows[s] = vec![y_bit(j)];
         }
     }
 
-    // Carry-save reduction. `s_sup[i]` = current partial-sum wire of product
-    // bit `i` (always a single materialized wire); `c_sup[i]` = pending
-    // carry into bit `i` (≤ 2-term expression, never materialized).
-    let mut s_sup: Vec<Sup> = (0..WORD_BITS).map(|i| vec![pp_bit(0, i)]).collect();
-    let mut c_sup: Vec<Sup> = vec![Sup::new(); WORD_BITS];
+    // Carry-save reduction over the 128 product-bit positions. `s_sup[i]` =
+    // current partial-sum wire of product bit `i` (single materialized wire,
+    // or empty above the covered span); `c_sup[i]` = pending carry into bit
+    // `i` (≤ 2-term expression, never materialized).
+    let mut s_sup: Vec<Sup> = (0..PROD_BITS)
+        .map(|i| {
+            if i < WORD_BITS {
+                vec![pp_bit(0, i)]
+            } else {
+                Sup::new()
+            }
+        })
+        .collect();
+    let mut c_sup: Vec<Sup> = vec![Sup::new(); PROD_BITS + 1];
 
     for j in 1..WORD_BITS {
-        let mut next_c: Vec<Sup> = vec![Sup::new(); WORD_BITS];
-        for i in j..WORD_BITS {
+        let mut next_c: Vec<Sup> = vec![Sup::new(); PROD_BITS + 1];
+        for i in j..j + WORD_BITS {
             let p = vec![pp_bit(j, i)];
             let s = std::mem::take(&mut s_sup[i]);
             let c = std::mem::take(&mut c_sup[i]);
-            if i < WORD_BITS - 1 {
-                // maj wire m = (s ⊕ c)(s ⊕ p); carry-out = maj(s, c, p) = m ⊕ s.
-                let m = maj_bit(j, i);
-                a_rows[m] = xor_sup(&[&s, &c]);
-                b_rows[m] = xor_sup(&[&s, &p]);
-                next_c[i + 1] = xor_sup(&[&vec![m], &s]);
-            }
+            // maj wire m = (s ⊕ c)(s ⊕ p); carry-out = maj(s, c, p) = m ⊕ s.
+            // Full product: every carry is kept.
+            let m = maj_bit(j, i);
+            a_rows[m] = xor_sup(&[&s, &c]);
+            b_rows[m] = xor_sup(&[&s, &p]);
+            next_c[i + 1] = xor_sup(&[&vec![m], &s]);
             // Materialized FA sum = s ⊕ c ⊕ p. The round-`i` sum of bit `i`
             // is final — it lives in the PROD region.
             let slot = if i == j { prod_bit(i) } else { sum_bit(j, i) };
@@ -186,6 +203,26 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             s_sup[i] = vec![slot];
         }
         c_sup = next_c;
+    }
+
+    // Final ripple-carry over bits 64..128: FA(s, c63, cr) per position.
+    let mut cr = Sup::new();
+    for i in WORD_BITS..PROD_BITS {
+        let s = std::mem::take(&mut s_sup[i]); // empty at i = 127
+        let c = std::mem::take(&mut c_sup[i]);
+        if i < PROD_BITS - 1 {
+            let m = rip_bit(i);
+            a_rows[m] = xor_sup(&[&s, &c]);
+            b_rows[m] = xor_sup(&[&s, &cr]);
+            let next_cr = xor_sup(&[&vec![m], &s]);
+            a_rows[prod_bit(i)] = xor_sup(&[&s, &c, &cr]);
+            b_rows[prod_bit(i)] = vec![Z_CONST_POS];
+            cr = next_cr;
+        } else {
+            // Bit 127: carry out is identically zero (x·y < 2^128) — sum only.
+            a_rows[prod_bit(i)] = xor_sup(&[&s, &c, &cr]);
+            b_rows[prod_bit(i)] = vec![Z_CONST_POS];
+        }
     }
 
     // prod[0] = pp(0, 0) · 1 — bit 0 is final immediately after row 0.
@@ -233,36 +270,52 @@ pub fn build_block_witness(x: u64, y: u64) -> Vec<bool> {
         z[y_bit(b)] = bit(y, b);
     }
     for j in 0..WORD_BITS {
-        for i in j..WORD_BITS {
+        for i in j..j + WORD_BITS {
             z[pp_bit(j, i)] = bit(x, i - j) && bit(y, j);
         }
     }
-    let mut s: Vec<bool> = (0..WORD_BITS).map(|i| z[pp_bit(0, i)]).collect();
-    let mut c = vec![false; WORD_BITS];
+    let mut s = [false; PROD_BITS];
+    let mut c = [false; PROD_BITS + 1];
+    for (i, si) in s.iter_mut().enumerate().take(WORD_BITS) {
+        *si = z[pp_bit(0, i)];
+    }
     for j in 1..WORD_BITS {
-        let mut next_c = vec![false; WORD_BITS];
-        for i in j..WORD_BITS {
+        let mut next_c = [false; PROD_BITS + 1];
+        for i in j..j + WORD_BITS {
             let p = z[pp_bit(j, i)];
             let (sv, cv) = (s[i], c[i]);
-            if i < WORD_BITS - 1 {
-                let m = (sv ^ cv) & (sv ^ p);
-                z[maj_bit(j, i)] = m;
-                next_c[i + 1] = m ^ sv;
-            }
+            let m = (sv ^ cv) & (sv ^ p);
+            z[maj_bit(j, i)] = m;
+            next_c[i + 1] = m ^ sv;
             let sum = sv ^ cv ^ p;
             let slot = if i == j { prod_bit(i) } else { sum_bit(j, i) };
             z[slot] = sum;
             s[i] = sum;
         }
+        // Positions above the round's span keep their sum untouched but must
+        // not lose an already-pending carry — there is none: round j−1's
+        // carries land within [j, j + 64], all inside round j's span.
         c = next_c;
+    }
+    let mut cr = false;
+    for i in WORD_BITS..PROD_BITS {
+        let (sv, cv) = (s[i], c[i]);
+        if i < PROD_BITS - 1 {
+            let m = (sv ^ cv) & (sv ^ cr);
+            z[rip_bit(i)] = m;
+            z[prod_bit(i)] = sv ^ cv ^ cr;
+            cr = m ^ sv;
+        } else {
+            z[prod_bit(i)] = sv ^ cv ^ cr;
+        }
     }
     z[prod_bit(0)] = z[pp_bit(0, 0)];
     z
 }
 
-/// Read the 64-bit product out of a single block of witness.
-pub fn read_prod(z: &[bool]) -> u64 {
-    (0..WORD_BITS).fold(0u64, |acc, b| acc | ((z[prod_bit(b)] as u64) << b))
+/// Read the 128-bit product out of a single block of witness.
+pub fn read_prod(z: &[bool]) -> u128 {
+    (0..PROD_BITS).fold(0u128, |acc, b| acc | ((z[prod_bit(b)] as u128) << b))
 }
 
 /// OR `val` (pre-masked to its width ≤ 64) into `buf` at bit offset `off`,
@@ -281,75 +334,96 @@ fn or_u64_at_bit(buf: &mut [u64], off: usize, val: u64) {
 
 /// Fused per-block builder: fill one block's `(z, a, b)` — three zeroed
 /// `K/64`-length u64 buffers — with the witness and its `A_0·z` / `B_0·z`
-/// images for `p = x·y mod 2^64`. Word-level: each FA round is a handful of
-/// u64 ops plus one contiguous span write per region.
+/// images for the full product `p = x·y`. Word-level: each FA round is a
+/// handful of u128 ops plus aligned word writes per region.
 pub(crate) fn build_block_zab(x: u64, y: u64, z: &mut [u64], a: &mut [u64], b: &mut [u64]) {
-    let p = x.wrapping_mul(y);
+    let p = (x as u128) * (y as u128);
 
-    // Aligned words 0..3: x, y, prod (b-side = const 1 → all-ones), Z_CONST.
+    // Aligned words 0..4: x, y, prod lo/hi (b-side = const 1 → all-ones),
+    // Z_CONST.
     z[0] = x;
     a[0] = x;
     b[0] = u64::MAX;
     z[1] = y;
     a[1] = y;
     b[1] = u64::MAX;
-    z[2] = p;
-    a[2] = p;
+    z[2] = p as u64;
+    a[2] = p as u64;
     b[2] = u64::MAX;
-    z[3] = 1;
-    a[3] = 1;
-    b[3] = 1;
+    z[3] = (p >> 64) as u64;
+    a[3] = (p >> 64) as u64;
+    b[3] = u64::MAX;
+    z[4] = 1;
+    a[4] = 1;
+    b[4] = 1;
 
     // Round 0: partial-sum word = pp row 0. Round words live in product-bit
-    // alignment (bit i of the word = product bit i).
-    let mut s = if y & 1 == 1 { x } else { 0 };
-    let mut c = 0u64;
-    z[4] = s; // pp row 0 sits word-aligned at PP_BASE = 256
-    a[4] = x;
-    b[4] = if y & 1 == 1 { u64::MAX } else { 0 };
+    // alignment (bit i of the u128 = product bit i).
+    let mut s = if y & 1 == 1 { x as u128 } else { 0 };
+    let mut c = 0u128;
+    let ppw = PP_BASE / 64; // pp row j is the aligned word ppw + j
+    z[ppw] = s as u64;
+    a[ppw] = x;
+    b[ppw] = if y & 1 == 1 { u64::MAX } else { 0 };
 
     for j in 1..WORD_BITS {
         let yj = (y >> j) & 1 == 1;
 
-        // pp row j: bit t = x_t · y_j for t < 64 − j.
-        let mask = u64::MAX >> j;
-        let off = PP_BASE + pp_off(j);
-        or_u64_at_bit(z, off, if yj { x & mask } else { 0 });
-        or_u64_at_bit(a, off, x & mask);
-        or_u64_at_bit(b, off, if yj { mask } else { 0 });
+        // pp row j: bit t = x_t · y_j (aligned word).
+        z[ppw + j] = if yj { x } else { 0 };
+        a[ppw + j] = x;
+        b[ppw + j] = if yj { u64::MAX } else { 0 };
 
-        // FA round j over product bits i = j..64.
-        let pw = if yj { x << j } else { 0 };
+        // FA round j over product bits i = j..j+64. Bits < j of s are final
+        // product bits (c and pw are zero there, so they pass through sumw);
+        // bits ≥ j+64 of s, c, pw are zero, so majw ^ s vanishes outside the
+        // round's span and the carry word needs no masking.
+        let pw = if yj { (x as u128) << j } else { 0 };
         let axor = s ^ c;
         let bxor = s ^ pw;
         let majw = axor & bxor;
         let sumw = s ^ c ^ pw;
 
-        if j < WORD_BITS - 1 {
-            // maj wires i = j..63 and non-final sums i = j+1..64, both of
-            // width 63 − j → mask = 2^(63−j) − 1.
-            let mmask = u64::MAX >> (j + 1);
-            let moff = MAJ_BASE + fa_off(j);
-            or_u64_at_bit(z, moff, (majw >> j) & mmask);
-            or_u64_at_bit(a, moff, (axor >> j) & mmask);
-            or_u64_at_bit(b, moff, (bxor >> j) & mmask);
-            let soff = SUM_BASE + fa_off(j);
-            let sval = (sumw >> (j + 1)) & mmask;
-            or_u64_at_bit(z, soff, sval);
-            or_u64_at_bit(a, soff, sval);
-            or_u64_at_bit(b, soff, mmask);
-            // Carry-out = maj(s, c, p) = majw ⊕ s, shifted into bits
-            // j+1..64; the bit-63 carry-out is dropped mod 2^64.
-            c = ((majw ^ s) << 1) & (u64::MAX << (j + 1));
-        } else {
-            c = 0;
-        }
-        // Bits < j of sumw are untouched (c, pw are zero there), so the final
-        // product bits accumulate in place; the i = j (final) sum bit is
-        // already covered by the PROD word written above.
+        // maj wires i = j..j+64: exactly the aligned 64-bit window at bit j.
+        let mw = MAJ_BASE / 64 + (j - 1);
+        z[mw] = (majw >> j) as u64;
+        a[mw] = (axor >> j) as u64;
+        b[mw] = (bxor >> j) as u64;
+
+        // Non-final sums i = j+1..j+64 (63 bits, unaligned rows).
+        let soff = SUM_BASE + (WORD_BITS - 1) * (j - 1);
+        let sval = ((sumw >> (j + 1)) as u64) & (u64::MAX >> 1);
+        or_u64_at_bit(z, soff, sval);
+        or_u64_at_bit(a, soff, sval);
+        or_u64_at_bit(b, soff, u64::MAX >> 1);
+
+        // Carry-out = maj(s, c, p) = majw ⊕ s, shifted to its target bit.
+        c = (majw ^ s) << 1;
+        // The i = j (final) sum bit is already covered by the PROD words.
         s = sumw;
     }
-    debug_assert_eq!(s, p);
+
+    // Final ripple-carry over bits 64..128 (bit-serial).
+    let (mut mz, mut ma, mut mb) = (0u64, 0u64, 0u64);
+    let mut cr = 0u64;
+    for i in WORD_BITS..PROD_BITS {
+        let sv = ((s >> i) & 1) as u64;
+        let cv = ((c >> i) & 1) as u64;
+        debug_assert_eq!(sv ^ cv ^ cr, ((p >> i) as u64) & 1, "prod bit {i}");
+        if i < PROD_BITS - 1 {
+            let az = sv ^ cv;
+            let bz = sv ^ cr;
+            let m = az & bz;
+            let t = i - WORD_BITS;
+            mz |= m << t;
+            ma |= az << t;
+            mb |= bz << t;
+            cr = m ^ sv;
+        }
+    }
+    or_u64_at_bit(z, RIP_BASE, mz);
+    or_u64_at_bit(a, RIP_BASE, ma);
+    or_u64_at_bit(b, RIP_BASE, mb);
 }
 
 /// Build `(z, a, b, z_lincheck)` packed witness buffers for a batch of
@@ -369,10 +443,10 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 }
 
 /// Smallest `n_blocks_log` for a batch of `n_muls`: `m = K_LOG + n_blocks_log`
-/// must reach the Ligerito config floor (`m ≥ 22`), so `n_blocks_log ≥ 9`.
+/// must reach the Ligerito config floor (`m ≥ 22`), so `n_blocks_log ≥ 8`.
 pub fn min_n_blocks_log(n_muls: usize) -> usize {
     assert!(n_muls >= 1);
-    let n = n_muls.max(1 << 9);
+    let n = n_muls.max(1 << 8);
     n.next_power_of_two().trailing_zeros() as usize
 }
 
@@ -546,6 +620,7 @@ mod tests {
             (u64::MAX, u64::MAX),
             (1, u64::MAX),
             (1u64 << 63, 3),
+            (1u64 << 63, 1u64 << 63),
             (0xDEAD_BEEF_CAFE_F00D, 0x0123_4567_89AB_CDEF),
         ];
         let mut rng = Rng::new(seed);
@@ -557,8 +632,6 @@ mod tests {
     /// tile [0, USEFUL_BITS) with only the declared gap.
     #[test]
     fn layout_is_injective() {
-        assert_eq!(pp_off(WORD_BITS), PP_COUNT);
-        assert_eq!(fa_off(WORD_BITS), FA_COUNT);
         assert!(USEFUL_BITS <= K);
 
         let mut seen = vec![false; K];
@@ -569,21 +642,26 @@ mod tests {
         for b in 0..WORD_BITS {
             claim(x_bit(b));
             claim(y_bit(b));
+        }
+        for b in 0..PROD_BITS {
             claim(prod_bit(b));
         }
         claim(Z_CONST_POS);
         for j in 0..WORD_BITS {
-            for i in j..WORD_BITS {
+            for i in j..j + WORD_BITS {
                 claim(pp_bit(j, i));
             }
         }
         for j in 1..WORD_BITS {
-            for i in j..WORD_BITS - 1 {
+            for i in j..j + WORD_BITS {
                 claim(maj_bit(j, i));
             }
-            for i in j + 1..WORD_BITS {
+            for i in j + 1..j + WORD_BITS {
                 claim(sum_bit(j, i));
             }
+        }
+        for i in WORD_BITS..PROD_BITS - 1 {
+            claim(rip_bit(i));
         }
         let n_claimed = seen.iter().filter(|&&x| x).count();
         assert_eq!(n_claimed, USEFUL_BITS - (PP_BASE - Z_CONST_POS - 1));
@@ -612,17 +690,22 @@ mod tests {
     }
 
     /// The boolean witness satisfies the circuit and carries the right
-    /// product; flipping a product bit breaks it.
+    /// full 128-bit product; flipping a product bit breaks it.
     #[test]
     fn witness_satisfies_and_product_correct() {
         let (a_0, b_0) = build_matrices();
         for (x, y) in test_pairs(24, 0x9E37) {
             let mut z = build_block_witness(x, y);
-            assert_eq!(read_prod(&z), x.wrapping_mul(y), "x={x:#x} y={y:#x}");
+            assert_eq!(
+                read_prod(&z),
+                (x as u128) * (y as u128),
+                "x={x:#x} y={y:#x}"
+            );
             satisfies_singleblock(&a_0, &b_0, &z)
                 .unwrap_or_else(|r| panic!("row {r} unsatisfied for x={x:#x} y={y:#x}"));
-            // Tamper: flip one product bit → some row must break.
-            let flip = prod_bit((x ^ y) as usize % WORD_BITS);
+            // Tamper: flip one product bit (incl. the high half) → some row
+            // must break.
+            let flip = prod_bit((x ^ y) as usize % PROD_BITS);
             z[flip] = !z[flip];
             assert!(
                 satisfies_singleblock(&a_0, &b_0, &z).is_err(),
@@ -667,13 +750,13 @@ mod tests {
     }
 
     /// End-to-end Ligerito roundtrip + tamper rejection at the smallest
-    /// supported shape (m = 22, 512 slots).
+    /// supported shape (m = 22, 256 slots).
     #[test]
     #[ignore] // Heavier — run with `cargo test -p flock-prover --release mul64 -- --ignored`
     fn prove_fast_roundtrip_ligerito() {
         use flock_core::challenger::FsChallenger;
 
-        let n_muls = 300; // < 512 slots → exercises padding blocks
+        let n_muls = 200; // < 256 slots → exercises padding blocks
         let setup = Mul64Setup::new(n_muls);
         assert_eq!(setup.m(), 22);
         let mut rng = Rng::new(0x6412_AB01);

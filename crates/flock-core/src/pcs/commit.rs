@@ -25,9 +25,10 @@ use serde::{Deserialize, Serialize};
 /// Interleaved RS: the packed witness is split into `2^log_batch_size`
 /// independent sub-NTTs of size `2^log_dim` each. Each Merkle leaf holds one
 /// codeword position across all `2^log_batch_size` lanes
-/// (`2^log_batch_size · 16` bytes per leaf). This trades leaf-call SHA-256
+/// (`2^log_batch_size · 16` bytes per leaf). This trades per-leaf hash-call
 /// overhead (was 16 B leaves, now 512 B leaves at default `log_batch_size=5`)
-/// for much fewer Merkle nodes and better scaling to large `m`.
+/// for much fewer Merkle nodes and better scaling to large `m` — and 512 B
+/// leaves take the SIMD-batched BLAKE3 path in [`crate::merkle`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PcsParams {
     pub m: usize,

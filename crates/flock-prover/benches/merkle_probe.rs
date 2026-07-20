@@ -1,6 +1,6 @@
 //! Merkle build probe: tight loop on `merkle::merkle_tree` over a codeword-sized
-//! byte buffer. Captures the SHA-256-with-ARM-crypto-extension hash chain that
-//! pcs::commit pays for the row-batch tree.
+//! byte buffer. Captures the SIMD-batched BLAKE3 hash chain that pcs::commit
+//! pays for the row-batch tree.
 //!
 //! Usage:
 //!   cargo bench --bench merkle_probe --no-run

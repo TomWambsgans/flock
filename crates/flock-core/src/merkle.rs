@@ -1,5 +1,5 @@
-//! Binary Merkle tree with SHA-256, using four-way hardware SHA interleaving
-//! on supported ARM and x86-64 targets.
+//! Binary Merkle tree with BLAKE3, SIMD-batching independent node hashes
+//! across the tree via blake3's multi-input `hash_many` kernels.
 //!
 //! Layout for `num_leaves = 2^k` leaves:
 //!   tree[0..num_leaves]                              = leaf hashes (level k)
@@ -10,10 +10,16 @@
 //! Total nodes: `2·num_leaves − 1`. The flat layout keeps the tree contiguous
 //! in memory for cheap Merkle-path extraction later.
 //!
-//! Hash uses the [`sha2`] crate. On aarch64 with the `sha2` target feature
-//! (set implicitly by `target-cpu=native` on M-series), the crate uses
-//! `sha256h`/`sha256h2`/`sha256su0`/`sha256su1` ARM crypto extension
-//! instructions; this is detected at runtime by [`cpufeatures`].
+//! Hashing is standard one-shot BLAKE3: a leaf is `blake3::hash(leaf_bytes)`,
+//! an internal node is `blake3::hash(left ‖ right)` — a single 64→32
+//! compression. Bulk hashing exploits that a whole-block single-chunk message
+//! (len a multiple of 64, ≤ 1024) is one root chunk, which blake3's SIMD
+//! `hash_many` reproduces exactly when given `CHUNK_START` / `CHUNK_END|ROOT`
+//! flags (verified in tests). Independent leaves and same-level internal nodes
+//! are batched 4–16 wide this way (the batching idea is borrowed from
+//! leanVM-b's port of this module); other leaf sizes fall back to per-leaf
+//! `blake3::hash` under rayon. The PCS's hot trees (512 B / 1024 B leaves) all
+//! take the batched path.
 //!
 //! No domain separation between leaf and internal hashes — this is a
 //! micro-benchmark module, not production code. A production PCS commit
@@ -21,57 +27,30 @@
 //! pre-images and avoid second-preimage attacks via interpretation collision.
 
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 
 pub type Hash = [u8; 32];
 
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "sha2"),
-    all(target_arch = "x86_64", target_feature = "sha")
-))]
-const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+// BLAKE3 constants for driving `Platform::hash_many` directly: the standard
+// IV (we hash unkeyed) and the flag bits of a root single-chunk message.
+const B3_IV: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
 ];
+const B3_CHUNK_START: u8 = 1;
+const B3_CHUNK_END: u8 = 2;
+const B3_ROOT: u8 = 8;
 
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "sha2"),
-    all(target_arch = "x86_64", target_feature = "sha")
-))]
-const SHA256_IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
+/// Nodes per rayon task in the batched leaf/pair paths: enough inputs to fill
+/// and amortize the widest SIMD batch, small enough to stay cache-resident.
+const GROUP: usize = 1024;
 
-/// 4-way interleaved SHA-256 using ARM crypto-extension intrinsics.
-///
-/// The M-series SHA unit is pipelined: a single dependent compress
-/// chain runs at ~21 ns/compress, while interleaved independent
-/// streams sustain ~16 ns/compress on real (distinct) data — a ~1.35×
-/// throughput win, measured on M4 Max at m=30. The `sha2` crate hashes
-/// one stream at a time, so bulk Merkle hashing (independent leaves /
-/// independent nodes within a level) leaves that on the table.
-///
-/// Digests are byte-identical to `Sha256::digest`.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-#[path = "merkle/aarch64.rs"]
-mod sha256x4;
-
-/// Four SHA-256 streams interleaved across the x86 SHA-NI pipeline.
-///
-/// SHA-NI accelerates one stream but retains a dependent state chain. Running
-/// four independent states round-for-round exposes enough instruction-level
-/// parallelism for bulk Merkle leaves and same-level parent nodes.
-#[cfg(all(target_arch = "x86_64", target_feature = "sha"))]
-#[path = "merkle/x86_64.rs"]
-mod sha256x4;
-
-/// Global SHA-256 call/compression counters, enabled with
+/// Global BLAKE3 call/compression counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
 /// Relaxed atomics — exact totals, no ordering guarantees across threads.
 #[cfg(feature = "hash-count")]
@@ -82,11 +61,14 @@ pub mod hash_count {
     pub static LEAF_COMPRESSIONS: AtomicU64 = AtomicU64::new(0);
     pub static PAIR_CALLS: AtomicU64 = AtomicU64::new(0);
 
-    /// SHA-256 compression count for a one-shot hash of `len` bytes:
-    /// ceil((len + 9) / 64) — payload + 0x80 pad + 8-byte length.
+    /// BLAKE3 compression count for a one-shot hash of `len` bytes:
+    /// ⌈len/64⌉ block compressions (min 1), plus one parent merge per chunk
+    /// beyond the first (`⌈len/1024⌉ − 1`).
     #[inline]
-    pub fn sha256_blocks(len: usize) -> u64 {
-        ((len + 9).div_ceil(64)) as u64
+    pub fn blake3_compressions(len: usize) -> u64 {
+        let blocks = len.div_ceil(64).max(1);
+        let parents = len.div_ceil(1024).saturating_sub(1);
+        (blocks + parents) as u64
     }
 
     pub fn reset() {
@@ -96,7 +78,7 @@ pub mod hash_count {
     }
 
     /// (leaf_calls, leaf_compressions, pair_calls). Each pair hash is
-    /// 2 compressions (64 B payload + padding block).
+    /// 1 compression (a 64 B message is a single root block).
     pub fn snapshot() -> (u64, u64, u64) {
         (
             LEAF_CALLS.load(Relaxed),
@@ -113,20 +95,106 @@ pub fn hash_leaf(data: &[u8]) -> Hash {
     {
         use std::sync::atomic::Ordering::Relaxed;
         hash_count::LEAF_CALLS.fetch_add(1, Relaxed);
-        hash_count::LEAF_COMPRESSIONS.fetch_add(hash_count::sha256_blocks(data.len()), Relaxed);
+        hash_count::LEAF_COMPRESSIONS
+            .fetch_add(hash_count::blake3_compressions(data.len()), Relaxed);
     }
-    Sha256::digest(data).into()
+    *blake3::hash(data).as_bytes()
 }
 
-/// Hash a pair of children into a parent node (64 B → 32 B).
+/// Hash a pair of children into a parent node (64 B → 32 B): a single BLAKE3
+/// compression (one root block).
 #[inline]
 pub fn hash_pair(left: &Hash, right: &Hash) -> Hash {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut h = Sha256::new();
-    h.update(left);
-    h.update(right);
-    h.finalize().into()
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(left);
+    buf[32..].copy_from_slice(right);
+    *blake3::hash(&buf).as_bytes()
+}
+
+/// SIMD-batch `blake3::hash` over many independent `N`-byte inputs laid out
+/// contiguously in `data` (`N` a multiple of 64, ≤ 1024). Such a message is a
+/// single root chunk of whole blocks, which `hash_many` computes exactly:
+/// counter 0, `CHUNK_START` on the first block, `CHUNK_END|ROOT` on the last
+/// (byte-identity with one-shot `blake3::hash` is asserted in tests).
+fn hash_many_oneshot<const N: usize>(data: &[u8], out: &mut [Hash]) {
+    const {
+        assert!(N > 0 && N % 64 == 0 && N <= 1024);
+    }
+    debug_assert_eq!(data.len(), out.len() * N);
+    let plat = blake3::platform::Platform::detect();
+    let inputs: Vec<&[u8; N]> = data
+        .chunks_exact(N)
+        .map(|c| c.try_into().unwrap())
+        .collect();
+    // `Hash = [u8; 32]` is plain bytes; hash_many writes 32 B per input.
+    let out_bytes: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 32) };
+    plat.hash_many::<N>(
+        &inputs,
+        &B3_IV,
+        0,
+        blake3::IncrementCounter::No,
+        0,
+        B3_CHUNK_START,
+        B3_CHUNK_END | B3_ROOT,
+        out_bytes,
+    );
+}
+
+/// Hash all `out.len()` equal-size leaves of `data`, batching across leaves
+/// via [`hash_many_oneshot`] when the leaf size allows (whole-block single
+/// chunk — the PCS's power-of-two leaf sizes from 64 B to 1 KiB), else
+/// per-leaf [`hash_leaf`]. Rayon-parallel either way; byte-identical to
+/// calling [`hash_leaf`] on every leaf.
+fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) {
+    fn batched<const N: usize>(data: &[u8], out: &mut [Hash]) {
+        #[cfg(feature = "hash-count")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+            hash_count::LEAF_COMPRESSIONS
+                .fetch_add(out.len() as u64 * hash_count::blake3_compressions(N), Relaxed);
+        }
+        out.par_chunks_mut(GROUP)
+            .zip(data.par_chunks(GROUP * N))
+            .for_each(|(outs, leaves)| hash_many_oneshot::<N>(leaves, outs));
+    }
+    match leaf_size {
+        64 => batched::<64>(data, out),
+        128 => batched::<128>(data, out),
+        256 => batched::<256>(data, out),
+        512 => batched::<512>(data, out),
+        1024 => batched::<1024>(data, out),
+        _ => out
+            .par_iter_mut()
+            .zip(data.par_chunks(leaf_size))
+            .for_each(|(o, leaf)| *o = hash_leaf(leaf)),
+    }
+}
+
+/// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`,
+/// with the pair compressions batched via [`hash_many_oneshot`] (children are
+/// contiguous 64-byte spans of the level below — zero-copy).
+///
+/// Small upper levels can't fill the cores, so a rayon dispatch per level
+/// costs more than the hashing itself; hash those in one serial (still
+/// SIMD-batched) call and only fan out the wide lower levels.
+fn hash_pairs_level(read: &[Hash], write: &mut [Hash]) {
+    #[cfg(feature = "hash-count")]
+    hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let read_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+    const SERIAL_LEVEL_NODES: usize = 1024;
+    if write.len() <= SERIAL_LEVEL_NODES {
+        hash_many_oneshot::<64>(read_bytes, write);
+    } else {
+        write
+            .par_chunks_mut(GROUP)
+            .zip(read_bytes.par_chunks(GROUP * 64))
+            .for_each(|(outs, children)| hash_many_oneshot::<64>(children, outs));
+    }
 }
 
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
@@ -159,50 +227,8 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
     // was just written) and writes itself.
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
 
-    // 1. Leaves — fully parallel; 4-way interleaved SHA where available.
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "sha2"),
-        all(target_arch = "x86_64", target_feature = "sha")
-    ))]
-    {
-        tree[..num_leaves]
-            .par_chunks_mut(4)
-            .zip(data.par_chunks(4 * leaf_size))
-            .for_each(|(outs, leaves)| {
-                if outs.len() == 4 {
-                    #[cfg(feature = "hash-count")]
-                    {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        hash_count::LEAF_CALLS.fetch_add(4, Relaxed);
-                        hash_count::LEAF_COMPRESSIONS
-                            .fetch_add(4 * hash_count::sha256_blocks(leaf_size), Relaxed);
-                    }
-                    sha256x4::hash4_equal_len(
-                        [
-                            &leaves[..leaf_size],
-                            &leaves[leaf_size..2 * leaf_size],
-                            &leaves[2 * leaf_size..3 * leaf_size],
-                            &leaves[3 * leaf_size..],
-                        ],
-                        outs,
-                    );
-                } else {
-                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
-                        *out = hash_leaf(leaf);
-                    }
-                }
-            });
-    }
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_feature = "sha2"),
-        all(target_arch = "x86_64", target_feature = "sha")
-    )))]
-    {
-        tree[..num_leaves]
-            .par_iter_mut()
-            .zip(data.par_chunks(leaf_size))
-            .for_each(|(out, leaf)| *out = hash_leaf(leaf));
-    }
+    // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
+    hash_leaves(data, leaf_size, &mut tree[..num_leaves]);
 
     // 2. Internal levels — parallel within a level, sequential across levels.
     let mut read_start = 0usize;
@@ -214,62 +240,7 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
         let (read, rest) = tree[read_start..].split_at_mut(read_len);
         let write = &mut rest[..next_len];
 
-        // 4 parents at a time = 8 contiguous children = 256 contiguous bytes;
-        // each parent hashes its 64-byte child pair, interleaved 4-way.
-        #[cfg(any(
-            all(target_arch = "aarch64", target_feature = "sha2"),
-            all(target_arch = "x86_64", target_feature = "sha")
-        ))]
-        {
-            let read_bytes: &[u8] =
-                unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
-            let hash_quad = |outs: &mut [Hash], children: &[u8]| {
-                if outs.len() == 4 {
-                    #[cfg(feature = "hash-count")]
-                    hash_count::PAIR_CALLS.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
-                    sha256x4::hash4_equal_len(
-                        [
-                            &children[..64],
-                            &children[64..128],
-                            &children[128..192],
-                            &children[192..256],
-                        ],
-                        outs,
-                    );
-                } else {
-                    for (i, out) in outs.iter_mut().enumerate() {
-                        let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
-                        let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
-                        *out = hash_pair(l, r);
-                    }
-                }
-            };
-            // Small upper levels can't fill the cores (≤ SERIAL_LEVEL_NODES / 4
-            // SHA-x4 tasks), so a rayon dispatch per level costs more than the
-            // hashing itself (~3× at the top of a 2^18 tree). Hash them serially
-            // — still 4-way SIMD — and only fan out the wide lower levels.
-            const SERIAL_LEVEL_NODES: usize = 1024;
-            if write.len() <= SERIAL_LEVEL_NODES {
-                for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
-                    hash_quad(outs, children);
-                }
-            } else {
-                write
-                    .par_chunks_mut(4)
-                    .zip(read_bytes.par_chunks(256))
-                    .for_each(|(outs, children)| hash_quad(outs, children));
-            }
-        }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_feature = "sha2"),
-            all(target_arch = "x86_64", target_feature = "sha")
-        )))]
-        {
-            write
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(i, out)| *out = hash_pair(&read[2 * i], &read[2 * i + 1]));
-        }
+        hash_pairs_level(read, write);
 
         read_start += read_len;
         read_len = next_len;
@@ -524,6 +495,49 @@ mod tests {
         assert_eq!(root, hash_leaf(&data));
     }
 
+    /// `hash_leaf` / `hash_pair` are plain one-shot BLAKE3 — the contract the
+    /// batched `hash_many` paths must reproduce.
+    #[test]
+    fn hash_primitives_are_oneshot_blake3() {
+        let data: Vec<u8> = (0..100).collect();
+        assert_eq!(hash_leaf(&data), *blake3::hash(&data).as_bytes());
+
+        let l: Hash = std::array::from_fn(|i| i as u8);
+        let r: Hash = std::array::from_fn(|i| (i as u8).wrapping_mul(3));
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&l);
+        buf[32..].copy_from_slice(&r);
+        assert_eq!(hash_pair(&l, &r), *blake3::hash(&buf).as_bytes());
+    }
+
+    /// blake3's SIMD `hash_many` with counter 0 and `CHUNK_START` /
+    /// `CHUNK_END|ROOT` flags must reproduce one-shot `blake3::hash` for every
+    /// whole-block single-chunk input size the batched paths dispatch on —
+    /// the invariant [`hash_many_oneshot`] relies on.
+    #[test]
+    fn hash_many_matches_oneshot_blake3() {
+        fn check<const N: usize>() {
+            let n_inputs = 5; // odd, to leave a partial SIMD batch
+            let data: Vec<u8> = (0..n_inputs * N)
+                .map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8)
+                .collect();
+            let mut out = vec![[0u8; 32]; n_inputs];
+            hash_many_oneshot::<N>(&data, &mut out);
+            for (i, h) in out.iter().enumerate() {
+                assert_eq!(
+                    h,
+                    blake3::hash(&data[i * N..(i + 1) * N]).as_bytes(),
+                    "N={N} input {i}"
+                );
+            }
+        }
+        check::<64>();
+        check::<128>();
+        check::<256>();
+        check::<512>();
+        check::<1024>();
+    }
+
     #[test]
     fn parallel_matches_sequential() {
         // Use a non-trivial size: 1024 leaves × 64 B = 64 KB.
@@ -539,13 +553,25 @@ mod tests {
         assert_eq!(par, seq);
     }
 
-    /// Leaf sizes chosen to hit every SHA-256 tail shape in the 4-way
-    /// interleaved path: rem = 0 (block-aligned), rem < 56 (one tail block),
-    /// and rem ≥ 56 (two tail blocks). Also a non-multiple-of-4 leaf count
-    /// for the remainder fallback.
+    /// Leaf sizes chosen to hit every dispatch shape in `hash_leaves`: each
+    /// batched width (64..1024 B), the per-leaf fallback (16/32/48/100 B, and
+    /// a multi-chunk 2048 B leaf), plus leaf counts that exercise partial
+    /// GROUPs and the serial-vs-parallel internal-level split.
     #[test]
-    fn parallel_matches_sequential_tail_shapes() {
-        for (n_leaves, leaf_size) in [(64, 1024), (64, 100), (64, 60), (64, 56), (2, 48), (16, 1)] {
+    fn parallel_matches_sequential_all_shapes() {
+        for (n_leaves, leaf_size) in [
+            (64, 64),
+            (64, 128),
+            (64, 256),
+            (4096, 512),
+            (64, 1024),
+            (64, 16),
+            (64, 32),
+            (2, 48),
+            (64, 100),
+            (16, 2048),
+            (16, 1),
+        ] {
             let mut data = vec![0u8; n_leaves * leaf_size];
             for (i, b) in data.iter_mut().enumerate() {
                 *b = ((i.wrapping_mul(0x6C8E944D)) & 0xff) as u8;

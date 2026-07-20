@@ -9,9 +9,9 @@
 //! with backend ∈ {bf, lig}.
 //!
 //! Reported per run:
-//!   - SHA-256 Merkle leaf hashes (calls + compressions; a leaf of L bytes is
-//!     ceil((L+9)/64) compressions)
-//!   - SHA-256 Merkle path/pair hashes (2 compressions each)
+//!   - BLAKE3 Merkle leaf hashes (calls + compressions; a leaf of L bytes is
+//!     ceil(L/64) block compressions + ceil(L/1024)−1 parent merges)
+//!   - BLAKE3 Merkle path/pair hashes (1 compression each)
 //!   - SHA-256 PoW checks (1 compression each)
 //!   - BLAKE3 Fiat–Shamir absorption (bytes + squeezes, ≈ compressions)
 
@@ -47,24 +47,21 @@ fn reset_counters() {
 fn report(label: &str, blake3_bytes: u64) {
     let (leaf_calls, leaf_compr, pair_calls) = hash_count::snapshot();
     let (squeezes, pow) = fs_count::snapshot();
-    let sha_total = leaf_compr + 2 * pair_calls + pow;
-    // BLAKE3 estimate: 1 compression per 64-byte block, 1 parent per 1 KiB
-    // chunk, ~2 extra per squeeze for finalization of the pending state.
+    let merkle_total = leaf_compr + pair_calls; // pair hash = 1 compression (64 B root block)
+    // FS-transcript BLAKE3 estimate: 1 compression per 64-byte block, 1 parent
+    // per 1 KiB chunk, ~2 extra per squeeze for finalization of pending state.
     let blake3_est = blake3_bytes.div_ceil(64) + blake3_bytes.div_ceil(1024) + 2 * squeezes;
     println!("  [{label}]");
-    println!("    SHA-256 leaf hashes : {leaf_calls:>8} calls = {leaf_compr:>8} compressions");
-    println!(
-        "    SHA-256 pair hashes : {pair_calls:>8} calls = {:>8} compressions",
-        2 * pair_calls
-    );
+    println!("    BLAKE3 leaf hashes  : {leaf_calls:>8} calls = {leaf_compr:>8} compressions");
+    println!("    BLAKE3 pair hashes  : {pair_calls:>8} calls = {pair_calls:>8} compressions");
+    println!("    BLAKE3 Merkle TOTAL : {merkle_total:>8} compressions");
     println!("    SHA-256 PoW checks  : {pow:>8} calls = {pow:>8} compressions");
-    println!("    SHA-256 TOTAL       : {sha_total:>8} compressions");
     println!(
         "    BLAKE3 FS transcript: {blake3_bytes:>8} bytes absorbed, {squeezes} squeezes ≈ {blake3_est} compressions"
     );
     println!(
-        "    GRAND TOTAL (SHA-256 + BLAKE3 est.) ≈ {} compressions",
-        sha_total + blake3_est
+        "    GRAND TOTAL (BLAKE3 merkle + SHA-256 PoW + BLAKE3 FS est.) ≈ {} compressions",
+        merkle_total + pow + blake3_est
     );
 }
 

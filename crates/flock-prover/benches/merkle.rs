@@ -1,21 +1,21 @@
-//! SHA-256 + Merkle-tree throughput sanity check.
+//! BLAKE3 + Merkle-tree throughput sanity check.
 //!
 //! Three measurements:
-//! 1. **Raw streaming SHA-256**: one `Sha256` finalize over a large contiguous
-//!    buffer. Reports the per-byte cost of the hash itself — should hit
-//!    ~2.6 GB/s on M4 Max with HW acceleration, ~0.5 GB/s on the software
-//!    fallback (footgun: needs `features = ["asm"]` in Cargo.toml).
-//! 2. **Per-leaf SHA-256**: digest one 16-byte leaf at a time, summed over
-//!    many leaves (= what `merkle_tree`'s leaf level does sequentially).
+//! 1. **Raw one-shot BLAKE3**: one `blake3::hash` over a large contiguous
+//!    buffer. Reports the per-byte cost of the hash itself (single-threaded;
+//!    SIMD across the chunks of the one input).
+//! 2. **Per-leaf BLAKE3**: digest one 16-byte leaf at a time, summed over
+//!    many leaves (= what `merkle_tree`'s leaf level does sequentially on a
+//!    leaf size too small for the cross-leaf `hash_many` batch).
 //! 3. **Merkle tree (parallel)**: full tree build over a buffer matching the
-//!    PCS commit @ m=29 leaf count.
+//!    PCS commit @ m=29 leaf count, at both the legacy 16 B leaf geometry and
+//!    the batched 512 B geometry (`log_batch_size=5` default).
 //!
 //! Run: `cargo bench --bench merkle`
 
 use std::time::Instant;
 
 use flock_prover::merkle::{hash_leaf, merkle_tree};
-use sha2::{Digest, Sha256};
 
 fn fmt_secs(s: f64) -> String {
     if s < 1e-3 {
@@ -74,18 +74,18 @@ fn alloc_pattern(bytes: usize, seed: u64) -> Vec<u8> {
     buf
 }
 
-/// Raw SHA-256: one `digest` over the whole buffer.
-fn bench_streaming_sha256(bytes: usize) {
+/// Raw BLAKE3: one `blake3::hash` over the whole buffer.
+fn bench_streaming_blake3(bytes: usize) {
     let data = alloc_pattern(bytes, 0xCAFE);
     // Warm-up.
-    let _ = Sha256::digest(&data);
+    let _ = blake3::hash(&data);
 
     let t0 = Instant::now();
-    let digest = Sha256::digest(&data);
+    let digest = blake3::hash(&data);
     let secs = t0.elapsed().as_secs_f64();
-    let cs: u64 = u64::from_le_bytes(digest[..8].try_into().unwrap());
+    let cs: u64 = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap());
     report(
-        &format!("streaming Sha256::digest ({})", fmt_bytes(bytes as u64)),
+        &format!("one-shot blake3::hash ({})", fmt_bytes(bytes as u64)),
         secs,
         bytes as u64,
         1,
@@ -94,9 +94,10 @@ fn bench_streaming_sha256(bytes: usize) {
     eprintln!("  (digest cs: {:016x})", cs);
 }
 
-/// Per-leaf SHA-256: call `hash_leaf` once per 16-byte leaf, sequentially.
-/// This is what the Merkle leaf level does (modulo parallelism).
-fn bench_per_leaf_sha256(num_leaves: usize, leaf_size: usize) {
+/// Per-leaf BLAKE3: call `hash_leaf` once per 16-byte leaf, sequentially.
+/// This is what the Merkle leaf level does on the (unbatched) 16 B geometry,
+/// modulo parallelism.
+fn bench_per_leaf_blake3(num_leaves: usize, leaf_size: usize) {
     let total = num_leaves * leaf_size;
     let data = alloc_pattern(total, 0xBEEF);
     // Warm-up: hash a few leaves.
@@ -156,25 +157,21 @@ fn bench_merkle_tree(num_leaves: usize, leaf_size: usize) {
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-    println!("(target: aarch64 + sha2 — four-way HW SHA-256 path active)");
-    #[cfg(all(target_arch = "x86_64", target_feature = "sha"))]
-    println!("(target: x86_64 + SHA-NI — four-way HW SHA-256 path active)");
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_feature = "sha2"),
-        all(target_arch = "x86_64", target_feature = "sha")
-    )))]
-    println!("(target: software fallback path — HW SHA-256 NOT active)");
+    println!(
+        "(blake3 SIMD platform: {:?})",
+        blake3::platform::Platform::detect()
+    );
 
-    header("Streaming SHA-256 (single digest over a large buffer)");
-    bench_streaming_sha256(64 * 1024); // 64 KB — fits in L1
-    bench_streaming_sha256(8 * 1024 * 1024); // 8 MB — DRAM-ish
-    bench_streaming_sha256(128 * 1024 * 1024); // 128 MB — matches PCS m=29 codeword
+    header("One-shot BLAKE3 (single hash over a large buffer)");
+    bench_streaming_blake3(64 * 1024); // 64 KB — fits in L1
+    bench_streaming_blake3(8 * 1024 * 1024); // 8 MB — DRAM-ish
+    bench_streaming_blake3(128 * 1024 * 1024); // 128 MB — matches PCS m=29 codeword
 
-    header("Per-leaf SHA-256 (one call per 16-B leaf — leaf level cost)");
-    bench_per_leaf_sha256(8 * 1024 * 1024, 16); // 8M leaves × 16 B = 128 MB
+    header("Per-leaf BLAKE3 (one call per 16-B leaf — unbatched leaf level cost)");
+    bench_per_leaf_blake3(8 * 1024 * 1024, 16); // 8M leaves × 16 B = 128 MB
 
-    header("Merkle tree (parallel, matches PCS commit @ m=29 geometry)");
-    // m=29: codeword = 2^23 F128 = 128 MB. Leaves are 1 F128 = 16 B each, 2^23 leaves.
-    bench_merkle_tree(1 << 23, 16);
+    header("Merkle tree (parallel, PCS commit @ m=29 codeword bytes)");
+    // m=29: codeword = 2^23 F128 = 128 MB.
+    bench_merkle_tree(1 << 23, 16); // legacy 16 B leaves (per-leaf fallback path)
+    bench_merkle_tree(1 << 18, 512); // log_batch_size=5 default (hash_many batched path)
 }

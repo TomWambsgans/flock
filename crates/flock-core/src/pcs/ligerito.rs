@@ -9,7 +9,7 @@
 //!
 //! Ported from bolt-rs (`ligerito_recursive.rs`) onto Flock primitives:
 //! `F128` (GHASH irreducible), [`AdditiveNttF128`] (LCH novel basis,
-//! byte-identical to bolt-rs's FFT), SHA-256 merkle from [`crate::merkle`],
+//! byte-identical to bolt-rs's FFT), BLAKE3 merkle from [`crate::merkle`],
 //! and the [`Challenger`] trait for Fiat-Shamir.
 //!
 //! Soundness regimes (our paper App. C.3): unique decoding (Thm `ca-udr`,
@@ -603,7 +603,9 @@ pub struct LigeritoSecurityConfig {
     pub analysis_version: String,
     /// Field of the protocol. Example: `"f128"`.
     pub field: String,
-    /// Hash function used by Merkle + FS challenger. Example: `"sha256"`.
+    /// Hash function used by the PCS Merkle commitments. Example: `"blake3"`.
+    /// (The FS challenger transcript + PoW grinding are SHA-256, independent
+    /// of this choice.)
     pub hash: String,
     /// Where in the per-level FS transcript grinding is placed.
     pub grinding_step: GrindingStep,
@@ -1183,7 +1185,7 @@ impl LigeritoSecurityConfig {
             target_security_bits,
             analysis_version: "no_row_union_over_ben_sasson_2025_cor_1_4".into(),
             field: "f128".into(),
-            hash: "sha256".into(),
+            hash: "blake3".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
             levels,
             final_block: FinalBlockConfig { yr_log_n },
@@ -1349,7 +1351,7 @@ impl LigeritoSecurityConfig {
             target_security_bits: target_bits,
             analysis_version: analysis_version.into(),
             field: "f128".into(),
-            hash: "sha256".into(),
+            hash: "blake3".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
             levels,
             final_block: FinalBlockConfig {
@@ -4953,7 +4955,7 @@ mod tests {
         assert_eq!(cfg.m, 29);
         assert_eq!(cfg.log_n, 22);
         assert_eq!(cfg.initial_k, 6);
-        assert_eq!(cfg.hash, "sha256");
+        assert_eq!(cfg.hash, "blake3");
         assert_eq!(cfg.levels.len(), 5);
         // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
         // list union bound — single-codeword binding via the opening claim /
